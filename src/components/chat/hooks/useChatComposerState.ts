@@ -495,10 +495,11 @@ export function useChatComposerState({
       }
 
       let messageContent = currentInput;
-      const selectedThinkingMode = thinkingModes.find((mode: { id: string; prefix?: string }) => mode.id === thinkingMode);
+      const selectedThinkingMode = thinkingModes.find((mode: { id: string; prefix?: string; effortLevel?: string }) => mode.id === thinkingMode);
       if (selectedThinkingMode && selectedThinkingMode.prefix) {
         messageContent = `${selectedThinkingMode.prefix}: ${currentInput}`;
       }
+      const effortLevel = selectedThinkingMode?.effortLevel;
 
       let uploadedImages: unknown[] = [];
       if (attachedImages.length > 0) {
@@ -658,6 +659,7 @@ export function useChatComposerState({
             model: claudeModel,
             sessionSummary,
             images: uploadedImages,
+            effortLevel,
           },
         });
       }

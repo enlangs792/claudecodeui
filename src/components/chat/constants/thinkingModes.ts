@@ -7,7 +7,8 @@ export const thinkingModes = [
     description: 'Regular Claude response',
     icon: null,
     prefix: '',
-    color: 'text-gray-600'
+    color: 'text-gray-600',
+    effortLevel: undefined
   },
   {
     id: 'think',
@@ -15,7 +16,8 @@ export const thinkingModes = [
     description: 'Basic extended thinking',
     icon: Brain,
     prefix: 'think',
-    color: 'text-blue-600'
+    color: 'text-blue-600',
+    effortLevel: 'medium'
   },
   {
     id: 'think-hard',
@@ -23,7 +25,8 @@ export const thinkingModes = [
     description: 'More thorough evaluation',
     icon: Zap,
     prefix: 'think hard',
-    color: 'text-purple-600'
+    color: 'text-purple-600',
+    effortLevel: 'high'
   },
   {
     id: 'think-harder',
@@ -31,7 +34,8 @@ export const thinkingModes = [
     description: 'Deep analysis with alternatives',
     icon: Sparkles,
     prefix: 'think harder',
-    color: 'text-indigo-600'
+    color: 'text-indigo-600',
+    effortLevel: 'high'
   },
   {
     id: 'ultrathink',
@@ -39,6 +43,7 @@ export const thinkingModes = [
     description: 'Maximum thinking budget',
     icon: Atom,
     prefix: 'ultrathink',
-    color: 'text-red-600'
+    color: 'text-red-600',
+    effortLevel: 'high'
   }
 ];

@@ -154,6 +154,11 @@ function mapCliOptionsToSDK(options = {}) {
   // Since SDK 0.2.113, options.env replaces process.env instead of overlaying it.
   sdkOptions.env = { ...process.env };
 
+  // Set effort level if specified (controls reasoning effort in Claude Code)
+  if (options.effortLevel) {
+    sdkOptions.env.CLAUDE_CODE_EFFORT_LEVEL = options.effortLevel;
+  }
+
   // Resolve the executable eagerly on Windows because the SDK uses raw child_process.spawn,
   // which does not reliably follow npm's shell wrappers like cross-spawn does.
   sdkOptions.pathToClaudeCodeExecutable = resolveClaudeCodeExecutablePath(process.env.CLAUDE_CLI_PATH);
