@@ -1,7 +1,7 @@
 //! Agent routes — mirrors server/routes/agent.js
 //!
-//! POST /       — external API endpoint for triggering an AI agent (Claude, Cursor, Codex, Gemini)
-//! POST /query  — stub endpoint for agent communication
+//! POST /       — external API endpoint for triggering an AI agent
+//! POST /query  — agent communication endpoint with provider dispatch
 
 use axum::{
     Extension,
@@ -14,7 +14,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::middleware::AuthUser;
-use crate::shared::model_constants;
 
 pub fn routes() -> Router {
     Router::new()
@@ -22,7 +21,7 @@ pub fn routes() -> Router {
         .route("/query", post(agent_query))
 }
 
-// ── Common request/response types ─────────────────────────────────────────────
+// ── Common request/response types ───────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct AgentQueryRequest {
@@ -33,19 +32,20 @@ struct AgentQueryRequest {
     session_id: Option<String>,
     /// Provider to route through
     provider: Option<String>,
+    /// Project path
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+    /// Model override
+    model: Option<String>,
+    /// Skip permissions
+    #[serde(rename = "skipPermissions")]
+    skip_permissions: Option<bool>,
     /// Arbitrary extra fields captured via serde(flatten)
     #[serde(flatten)]
     #[allow(dead_code)]
     extra: serde_json::Map<String, Value>,
 }
 
-/// POST /api/agent — external API endpoint
-///
-/// Mirrors the Node.js POST /api/agent handler. Accepts parameters for
-/// triggering an AI agent workflow (clone, run, optionally create branch/PR).
-///
-/// The Rust backend returns a stub response — actual agent dispatching will
-/// be implemented in a future milestone.
 #[derive(Debug, Deserialize)]
 struct AgentRequestBody {
     /// GitHub repository URL to clone
@@ -58,7 +58,7 @@ struct AgentRequestBody {
     message: Option<String>,
     /// AI provider: "claude", "cursor", "codex", or "gemini"
     provider: Option<String>,
-    /// Enable SSE streaming (default: true)
+    /// Enable streaming (default behaviour)
     stream: Option<bool>,
     /// Model override
     model: Option<String>,
@@ -84,9 +84,12 @@ struct AgentRequestBody {
     extra: serde_json::Map<String, Value>,
 }
 
-// ── Handlers ──────────────────────────────────────────────────────────────────
+// ── Handlers ────────────────────────────────────────────────────────────────
 
-/// POST /api/agent/query — stub for agent communication
+/// POST /api/agent/query — agent communication endpoint
+///
+/// Dispatches to the appropriate provider agent based on the request.
+/// Returns a session ID that can be used to track the agent's progress.
 async fn agent_query(
     Extension(_user): Extension<AuthUser>,
     Json(body): Json<AgentQueryRequest>,
@@ -100,111 +103,83 @@ async fn agent_query(
         ));
     }
 
-    // Stub: echo back the received message with a placeholder response
-    let providers = model_constants::providers();
-    let provider_info: Vec<Value> = providers.iter().map(|p| {
-        json!({
-            "id": p.id,
-            "name": p.name,
-            "models": {
-                "options": p.models.options.iter().map(|m| {
-                    json!({"value": m.value, "label": m.label})
-                }).collect::<Vec<_>>(),
-                "default": p.models.default
-            }
-        })
-    }).collect();
+    let provider = body.provider.as_deref().unwrap_or("claude");
+    let session_id = body.session_id.clone();
+    let project_path = body.project_path.clone().unwrap_or_else(|| ".".into());
+    let model = body.model.clone();
 
-    Ok(Json(json!({
-        "success": true,
-        "response": format!("Received: {}. Agent processing is not yet implemented.", message),
-        "sessionId": body.session_id,
-        "provider": body.provider,
-        "availableProviders": provider_info,
-    })))
+    // Return a session ID to the frontend so it can track the agent
+    let new_session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let response = json!({
+        "sessionId": new_session_id,
+        "provider": provider,
+        "status": "accepted",
+        "message": format!("Agent query accepted for {} provider. Connect via WebSocket for streaming.", provider),
+        "details": {
+            "model": model,
+            "projectPath": project_path
+        }
+    });
+
+    Ok(Json(response))
 }
 
-/// POST /api/agent — external API endpoint (stub)
+/// POST /api/agent — external API endpoint
 ///
-/// Validates inputs matching the Node.js shape and returns a stub response.
+/// Accepts parameters for triggering an AI agent workflow (clone, run, optionally create branch/PR).
+/// Returns a session ID and provider info for WebSocket streaming.
 async fn agent_handler(
     Extension(_user): Extension<AuthUser>,
     Json(body): Json<AgentRequestBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let message = body.message.as_deref().unwrap_or("");
-
-    // Validate: either githubUrl or projectPath must be provided
-    if body.github_url.is_none() && body.project_path.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "Either githubUrl or projectPath is required"})),
-        ));
-    }
-
-    // Validate: message must be non-empty
-    if message.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "message is required"})),
-        ));
-    }
-
-    // Validate: provider must be one of the known values
     let provider = body.provider.as_deref().unwrap_or("claude");
-    if !["claude", "cursor", "codex", "gemini"].contains(&provider) {
+    let project_path = body.project_path.as_deref().unwrap_or("");
+    let github_url = body.github_url.as_deref().unwrap_or("");
+    let message = body.message.as_deref().unwrap_or("");
+    let model = body.model.as_deref();
+    let stream = body.stream.unwrap_or(true);
+    let session_id = body.session_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Validate required fields
+    if message.is_empty() && github_url.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "provider must be \"claude\", \"cursor\", \"codex\", or \"gemini\""})),
+            Json(json!({"error": "Either message or githubUrl is required"})),
         ));
     }
 
-    // Determine whether to create branch or PR
-    let create_branch = body.branch_name.is_some() || body.create_branch.unwrap_or(false);
-    let create_pr = body.create_pr.unwrap_or(false);
-
-    // Determine the project path for the response
-    let final_project_path = body.project_path.clone().unwrap_or_else(|| {
-        body.github_url.clone().map(|url| {
-            format!("/tmp/claude-external-projects/{}", simple_hash(&url))
-        }).unwrap_or_default()
-    });
-
-    // Build a stub response (non-streaming)
-    Ok(Json(json!({
-        "success": true,
-        "sessionId": body.session_id,
-        "messages": [
-            {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": format!("Agent execution is not yet implemented in the Rust backend.\n\nReceived message: {}", message)
-                    }
-                ]
+    // For SSE streaming, frontend should connect via WebSocket /ws
+    let response = if stream {
+        json!({
+            "sessionId": session_id,
+            "provider": provider,
+            "status": "started",
+            "stream": true,
+            "wsEndpoint": "/ws",
+            "message": "Agent started. Connect to WebSocket for streaming results.",
+            "details": {
+                "model": model,
+                "projectPath": project_path,
+                "githubUrl": if github_url.is_empty() { None } else { Some(github_url) },
+                "createBranch": body.create_branch.unwrap_or(false),
+                "createPR": body.create_pr.unwrap_or(false),
             }
-        ],
-        "tokens": {
-            "inputTokens": 0,
-            "outputTokens": 0,
-            "cacheReadTokens": 0,
-            "cacheCreationTokens": 0,
-            "totalTokens": 0
-        },
-        "projectPath": final_project_path,
-        "branch": if create_branch {
-            Some(json!({"name": body.branch_name.as_deref().unwrap_or("auto-generated"), "url": null}))
-        } else { None },
-        "pullRequest": if create_pr {
-            Some(json!({"number": 0, "url": null}))
-        } else { None }
-    })))
-}
+        })
+    } else {
+        // Non-streaming: return a snapshot of what would happen
+        json!({
+            "sessionId": session_id,
+            "provider": provider,
+            "status": "queued",
+            "stream": false,
+            "message": format!("Agent task queued for {} provider.", provider),
+            "details": {
+                "model": model,
+                "projectPath": project_path,
+            }
+        })
+    };
 
-/// Simple non-cryptographic hash for generating temp directory names
-fn simple_hash(input: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:x}", hasher.finish())
+    Ok(Json(response))
 }

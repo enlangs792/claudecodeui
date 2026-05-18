@@ -1043,19 +1043,111 @@ async fn migrate_legacy_stars(Json(body): Json<MigrateStarsBody>) -> Json<Value>
     }))
 }
 
-// ── GET /api/projects/clone-progress — SSE clone progress stub ─────────────────
+// ── GET /api/projects/clone-progress — SSE clone progress ──────────────────
 
 async fn clone_progress(
-    Query(_query): Query<CloneProgressQuery>,
+    Query(query): Query<CloneProgressQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = stream::iter(vec![
-        Ok(Event::default().data(r#"{"type":"progress","message":"Initializing clone..."}"#)),
-        Ok(Event::default()
-            .data(r#"{"type":"progress","message":"Repository cloning is not implemented in the Rust backend yet"}"#)),
-        Ok(Event::default().data(r#"{"type":"error","message":"Clone not available in Rust backend"}"#)),
-    ]);
+    let repo_url = query.github_url.as_deref().unwrap_or("");
+    let target_dir = query.path.as_deref().unwrap_or("");
 
-    Sse::new(stream).keep_alive(
+    // Validate required fields
+    if repo_url.is_empty() {
+        let events = vec![
+            Ok(Event::default().data(r#"{"type":"error","message":"repo_url query parameter is required"}"#)),
+            Ok(Event::default().event("done").data("{}")),
+        ];
+        return Sse::new(stream::iter(events)).keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text(serde_json::json!({"type":"keepalive"}).to_string()),
+        );
+    }
+
+    // Build events vector for clone progress simulation
+    let repo_name = repo_url
+        .split('/')
+        .last()
+        .unwrap_or("repo")
+        .trim_end_matches(".git");
+
+    let mut events: Vec<Result<Event, Infallible>> = Vec::new();
+
+    events.push(Ok(Event::default().data(
+        serde_json::json!({"type":"progress","message":"Initializing clone...","stage":"init"}).to_string()
+    )));
+
+    // Attempt git clone using spawn_blocking to avoid blocking async runtime
+    let dest = if target_dir.is_empty() {
+        let tmp = std::env::temp_dir().join(format!("cloudcli-clone-{}", uuid::Uuid::new_v4()));
+        tmp.display().to_string()
+    } else {
+        target_dir.to_string()
+    };
+
+    let clone_url = repo_url.to_string();
+    let clone_dest = dest.clone();
+    let clone_result = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("git")
+            .args(["clone", "--progress", &clone_url, &clone_dest])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+    })
+    .await;
+
+    match clone_result {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                events.push(Ok(Event::default().data(
+                    serde_json::json!({
+                        "type": "progress",
+                        "message": format!("Cloning {}...", repo_name),
+                        "stage": "cloning"
+                    }).to_string()
+                )));
+                events.push(Ok(Event::default().data(
+                    serde_json::json!({
+                        "type": "complete",
+                        "message": format!("Repository cloned successfully to {}", dest),
+                        "projectPath": dest,
+                        "repoName": repo_name
+                    }).to_string()
+                )));
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                events.push(Ok(Event::default().data(
+                    serde_json::json!({
+                        "type": "error",
+                        "message": format!("Clone failed: {}", stderr.trim()),
+                        "stage": "error"
+                    }).to_string()
+                )));
+            }
+        }
+        Ok(Err(e)) => {
+            events.push(Ok(Event::default().data(
+                serde_json::json!({
+                    "type": "error",
+                    "message": format!("Failed to start git clone: {}", e),
+                    "stage": "error"
+                }).to_string()
+            )));
+        }
+        Err(join_err) => {
+            events.push(Ok(Event::default().data(
+                serde_json::json!({
+                    "type": "error",
+                    "message": format!("Clone task panicked or was cancelled: {}", join_err),
+                    "stage": "error"
+                }).to_string()
+            )));
+        }
+    }
+
+    events.push(Ok(Event::default().event("done").data("{}")));
+
+    Sse::new(stream::iter(events)).keep_alive(
         axum::response::sse::KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text(serde_json::json!({"type":"keepalive"}).to_string()),

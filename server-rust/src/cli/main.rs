@@ -2,42 +2,16 @@
 //!
 //! Commands:
 //!   (no args) / start   Start the server (default)
+//!   sandbox             Manage Docker sandbox environments
 //!   status / info       Show configuration and data locations
+//!   update              Update to the latest version
 //!   help                Show help information
 //!   version             Show version information
 
+mod color;
+mod sandbox;
+
 use std::path::PathBuf;
-
-// ── ANSI colors ─────────────────────────────────────────────────────────────
-
-mod color {
-    pub const RESET: &str = "\x1b[0m";
-    pub const BRIGHT: &str = "\x1b[1m";
-    pub const DIM: &str = "\x1b[2m";
-    pub const CYAN: &str = "\x1b[36m";
-    pub const GREEN: &str = "\x1b[32m";
-    pub const YELLOW: &str = "\x1b[33m";
-    pub const BLUE: &str = "\x1b[34m";
-
-    pub fn info(text: &str) -> String {
-        format!("{CYAN}{text}{RESET}")
-    }
-    pub fn ok(text: &str) -> String {
-        format!("{GREEN}{text}{RESET}")
-    }
-    pub fn warn(text: &str) -> String {
-        format!("{YELLOW}{text}{RESET}")
-    }
-    pub fn tip(text: &str) -> String {
-        format!("{BLUE}{text}{RESET}")
-    }
-    pub fn bright(text: &str) -> String {
-        format!("{BRIGHT}{text}{RESET}")
-    }
-    pub fn dim(text: &str) -> String {
-        format!("{DIM}{text}{RESET}")
-    }
-}
 
 // ── App root resolution ─────────────────────────────────────────────────────
 
@@ -78,12 +52,125 @@ fn default_database_path() -> PathBuf {
         .join("database.sqlite")
 }
 
-// ── Commands ────────────────────────────────────────────────────────────────
+// ── Version ─────────────────────────────────────────────────────────────────
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── Semantic version comparison ─────────────────────────────────────────────
+
+fn is_newer_version(v1: &str, v2: &str) -> bool {
+    let parts1: Vec<u32> = v1.split('.').filter_map(|p| p.parse().ok()).collect();
+    let parts2: Vec<u32> = v2.split('.').filter_map(|p| p.parse().ok()).collect();
+    for i in 0..3 {
+        let a = parts1.get(i).copied().unwrap_or(0);
+        let b = parts2.get(i).copied().unwrap_or(0);
+        if a > b { return true; }
+        if a < b { return false; }
+    }
+    false
+}
+
+// ── Update check ────────────────────────────────────────────────────────────
+
+fn check_for_updates(silent: bool) {
+    use color::*;
+    let current_version = VERSION;
+
+    match std::process::Command::new("npm")
+        .args(["show", "@cloudcli-ai/cloudcli", "version"])
+        .output()
+    {
+        Ok(output) => {
+            let latest_version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if is_newer_version(&latest_version, current_version) {
+                println!(
+                    "\n{} New version available: {} (current: {})",
+                    warn("[UPDATE]"),
+                    bright(&latest_version),
+                    current_version
+                );
+                println!(
+                    "         Run {} to update\n",
+                    bright("cloudcli update")
+                );
+            } else if !silent {
+                println!(
+                    "{} You are on the latest version ({})",
+                    ok("[OK]"),
+                    current_version
+                );
+            }
+        }
+        Err(_) => {
+            if !silent {
+                println!("{} Could not check for updates", warn("[WARN]"));
+            }
+        }
+    }
+}
+
+fn update_package() {
+    use color::*;
+    println!("{} Checking for updates...", info("[INFO]"));
+
+    let current_version = VERSION;
+    match std::process::Command::new("npm")
+        .args(["show", "@cloudcli-ai/cloudcli", "version"])
+        .output()
+    {
+        Ok(output) => {
+            let latest_version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !is_newer_version(&latest_version, current_version) {
+                println!(
+                    "{} Already on the latest version ({})",
+                    ok("[OK]"),
+                    current_version
+                );
+                return;
+            }
+            println!(
+                "{} Updating from {} to {}...",
+                info("[INFO]"),
+                current_version,
+                latest_version
+            );
+            match std::process::Command::new("npm")
+                .args(["update", "-g", "@cloudcli-ai/cloudcli"])
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    println!(
+                        "{} Update complete! Restart cloudcli to use the new version.",
+                        ok("[OK]")
+                    );
+                }
+                _ => {
+                    eprintln!("{} Update failed", error("[ERROR]"));
+                    println!(
+                        "{} Try running manually: npm update -g @cloudcli-ai/cloudcli",
+                        tip("[TIP]")
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("{} Update failed: {e}", error("[ERROR]"));
+            println!(
+                "{} Try running manually: npm update -g @cloudcli-ai/cloudcli",
+                tip("[TIP]")
+            );
+        }
+    }
+}
+
+// ── Commands ────────────────────────────────────────────────────────────────
+
 const HELP: &str = r#"
 ╔═══════════════════════════════════════════════════════════════╗
-║              CloudCLI — Command Line Tool (Rust)              ║
+║              CloudCLI - Command Line Tool (Rust)              ║
 ╚═══════════════════════════════════════════════════════════════╝
 
 Usage:
@@ -91,7 +178,9 @@ Usage:
 
 Commands:
   start          Start the CloudCLI server (default)
+  sandbox        Manage Docker sandbox environments
   status         Show configuration and data locations
+  update         Update to the latest version
   help           Show this help information
   version        Show version information
 
@@ -104,12 +193,15 @@ Options:
 Examples:
   $ cloudcli                        # Start with defaults
   $ cloudcli --port 8080            # Start on port 8080
+  $ cloudcli sandbox ~/my-project   # Run in a Docker sandbox
   $ cloudcli status                 # Show configuration
 
 Environment Variables:
   SERVER_PORT         Set server port (default: 3001)
+  PORT                Set server port (default: 3001) (LEGACY)
   DATABASE_PATH       Set custom database location
-  HOST                Bind host (default: 0.0.0.0)
+  CLAUDE_CLI_PATH     Set custom Claude CLI path
+  CONTEXT_WINDOW      Set context window size (default: 160000)
 
 Documentation:
   https://cloudcli.ai
@@ -130,9 +222,13 @@ fn show_status() {
     let db_path = std::env::var("DATABASE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| default_database_path());
-    let server_port = std::env::var("SERVER_PORT").unwrap_or_else(|_| "3001".into());
+    let server_port = std::env::var("SERVER_PORT")
+        .or_else(|_| std::env::var("PORT"))
+        .unwrap_or_else(|_| "3001".into());
+    let claude_cli_path = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude (default)".into());
+    let context_window = std::env::var("CONTEXT_WINDOW").unwrap_or_else(|_| "160000 (default)".into());
 
-    println!("\n{}", bright("CloudCLI UI — Status\n"));
+    println!("\n{}", bright("CloudCLI UI - Status\n"));
     println!("{}", dim("═".repeat(60).as_str()));
 
     println!("\n{} Version: {}", info("[INFO]"), bright(VERSION));
@@ -161,11 +257,13 @@ fn show_status() {
     }
 
     println!("\n{} Configuration:", info("[INFO]"));
-    println!("       SERVER_PORT: {} {}", bright(&server_port), dim("(default)"));
+    println!("       SERVER_PORT: {} {}", bright(&server_port), dim(if std::env::var("SERVER_PORT").is_ok() || std::env::var("PORT").is_ok() { "" } else { "(default)" }));
     println!(
         "       DATABASE_PATH: {}",
         dim(&std::env::var("DATABASE_PATH").unwrap_or_else(|_| "(using default location)".into()))
     );
+    println!("       CLAUDE_CLI_PATH: {}", dim(&claude_cli_path));
+    println!("       CONTEXT_WINDOW: {}", dim(&context_window));
 
     // Claude projects folder
     let claude_projects = dirs::home_dir()
@@ -213,6 +311,7 @@ struct CliArgs {
     command: String,
     server_port: Option<String>,
     database_path: Option<String>,
+    remaining_args: Vec<String>,
 }
 
 fn parse_args() -> CliArgs {
@@ -220,6 +319,7 @@ fn parse_args() -> CliArgs {
     let mut command = String::from("start");
     let mut server_port = None;
     let mut database_path = None;
+    let mut remaining_args = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -246,6 +346,10 @@ fn parse_args() -> CliArgs {
             }
             a if !a.starts_with('-') => {
                 command = a.into();
+                if command == "sandbox" {
+                    remaining_args = args[(i + 1)..].to_vec();
+                    break;
+                }
             }
             _ => {}
         }
@@ -256,6 +360,7 @@ fn parse_args() -> CliArgs {
         command,
         server_port,
         database_path,
+        remaining_args,
     }
 }
 
@@ -283,8 +388,10 @@ fn load_env_file() {
 // ── Server start ────────────────────────────────────────────────────────────
 
 fn start_server() -> anyhow::Result<()> {
+    // Auto-check for updates silently on startup (mirrors TS behavior)
+    check_for_updates(true);
+
     // This spawns the actual Axum server in the current process.
-    // The server main is in src/main.rs — we just call into the library.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -292,7 +399,6 @@ fn start_server() -> anyhow::Result<()> {
         )
         .init();
 
-    // Initialize database, start server — same as main.rs
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         use cloudcli_server::db::connection::init_pool;
@@ -424,9 +530,16 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        "sandbox" => {
+            if let Err(e) = sandbox::sandbox_command_sync(&args.remaining_args) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         "status" | "info" => show_status(),
         "help" => show_help(),
         "version" => show_version(),
+        "update" => update_package(),
         other => {
             eprintln!("\n❌ Unknown command: {other}");
             eprintln!("   Run \"cloudcli help\" for usage information.\n");

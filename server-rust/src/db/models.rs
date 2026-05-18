@@ -288,3 +288,26 @@ pub struct NewAppConfig {
     pub key: String,
     pub value: String,
 }
+
+// ── GitHub Tokens ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
+#[diesel(table_name = crate::db::schema::github_tokens)]
+#[diesel(primary_key(id))]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct GitHubToken {
+    pub id: i32,
+    pub user_id: i32,
+    pub token: String,
+    pub token_name: Option<String>,
+    pub created_at: Option<chrono::NaiveDateTime>,
+    pub last_used: Option<chrono::NaiveDateTime>,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = crate::db::schema::github_tokens)]
+pub struct NewGitHubToken {
+    pub user_id: i32,
+    pub token: String,
+    pub token_name: Option<String>,
+}

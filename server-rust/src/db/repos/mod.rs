@@ -5,3 +5,4 @@ pub mod projects;
 pub mod sessions;
 pub mod credentials;
 pub mod app_config;
+pub mod github_tokens;

@@ -8,3 +8,4 @@ pub mod ws;
 pub mod providers;
 pub mod services;
 pub mod shared;
+pub mod agents;

@@ -103,6 +103,17 @@ diesel::table! {
 }
 
 diesel::table! {
+    github_tokens (id) {
+        id -> Integer,
+        user_id -> Integer,
+        token -> Text,
+        token_name -> Nullable<Text>,
+        created_at -> Nullable<Timestamp>,
+        last_used -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
     app_config (key) {
         key -> Text,
         value -> Text,
@@ -349,5 +360,15 @@ CREATE TABLE IF NOT EXISTS app_config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- GitHub Tokens
+CREATE TABLE IF NOT EXISTS github_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token TEXT NOT NULL,
+    token_name TEXT DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_used DATETIME DEFAULT NULL
 );
 ";

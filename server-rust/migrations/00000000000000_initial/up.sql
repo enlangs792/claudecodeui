@@ -105,5 +105,14 @@ CREATE TABLE IF NOT EXISTS app_config (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS github_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    token TEXT NOT NULL,
+    token_name TEXT DEFAULT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_used DATETIME DEFAULT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_projects_is_starred ON projects(isStarred);
 CREATE INDEX IF NOT EXISTS idx_projects_is_archived ON projects(isArchived);

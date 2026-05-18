@@ -72,12 +72,63 @@ async fn handle_chat(socket: WebSocket, auth_user: Option<middleware::AuthUser>)
         match msg {
             Message::Text(text) => {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let response = serde_json::json!({
-                        "type": "ack",
-                        "sessionId": parsed.get("sessionId"),
-                        "message": parsed
-                    });
-                    tx.send(response.to_string()).await.ok();
+                    let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let session_id = parsed.get("sessionId").and_then(|v| v.as_str());
+                    let provider = parsed.get("provider").and_then(|v| v.as_str()).unwrap_or("claude");
+                    let message = parsed.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                    let project_path = parsed.get("projectPath").and_then(|v| v.as_str()).unwrap_or(".");
+
+                    match msg_type {
+                        "user_message" | "query" => {
+                            // Acknowledge the message and indicate agent routing
+                            let response = serde_json::json!({
+                                "type": "session-created",
+                                "sessionId": session_id,
+                                "provider": provider,
+                                "status": "started",
+                                "message": format!("Routing to {} agent for project: {}", provider, project_path)
+                            });
+                            tx.send(response.to_string()).await.ok();
+
+                            // Route to appropriate agent based on provider
+                            let provider_response = match provider {
+                                "claude" => {
+                                    format!(r#"{{"type":"agent_message","provider":"claude","content":"[Claude agent would process: {}]"}}"#, message)
+                                }
+                                "codex" => {
+                                    format!(r#"{{"type":"agent_message","provider":"codex","content":"[Codex agent would process: {}]"}}"#, message)
+                                }
+                                "cursor" => {
+                                    format!(r#"{{"type":"agent_message","provider":"cursor","content":"[Cursor agent would process: {}]"}}"#, message)
+                                }
+                                "gemini" => {
+                                    format!(r#"{{"type":"agent_message","provider":"gemini","content":"[Gemini agent would process: {}]"}}"#, message)
+                                }
+                                _ => {
+                                    format!(r#"{{"type":"error","message":"Unknown provider: {}"}}"#, provider)
+                                }
+                            };
+                            tx.send(provider_response).await.ok();
+                        }
+                        "abort" | "cancel" => {
+                            let response = serde_json::json!({
+                                "type": "session_aborted",
+                                "sessionId": session_id,
+                                "status": "cancelled"
+                            });
+                            tx.send(response.to_string()).await.ok();
+                        }
+                        _ => {
+                            // Generic acknowledgment for other message types
+                            let response = serde_json::json!({
+                                "type": "ack",
+                                "sessionId": session_id,
+                                "messageType": msg_type,
+                                "message": parsed
+                            });
+                            tx.send(response.to_string()).await.ok();
+                        }
+                    }
                 }
             }
             Message::Close(_) => break,
@@ -124,8 +175,8 @@ async fn handle_shell(socket: WebSocket, auth_user: Option<middleware::AuthUser>
     };
 
     let mut child_stdin = child.stdin.take().expect("Failed to get stdin");
-    let mut child_stdout = child.stdout.take().expect("Failed to get stdout");
-    let mut child_stderr = child.stderr.take().expect("Failed to get stderr");
+    let child_stdout = child.stdout.take().expect("Failed to get stdout");
+    let child_stderr = child.stderr.take().expect("Failed to get stderr");
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
