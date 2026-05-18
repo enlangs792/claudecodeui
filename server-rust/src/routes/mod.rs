@@ -1,7 +1,13 @@
 pub mod auth;
+pub mod filesystem;
 pub mod git;
 pub mod user;
 pub mod settings;
 pub mod commands;
 pub mod agent;
 pub mod projects;
+pub mod taskmaster;
+pub mod mcp_utils;
+pub mod cursor;
+pub mod gemini;
+pub mod plugins;

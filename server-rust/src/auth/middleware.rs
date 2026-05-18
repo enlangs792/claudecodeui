@@ -71,8 +71,21 @@ pub fn generate_token(user_id: i64, username: &str) -> String {
     .expect("Failed to generate JWT")
 }
 
-/// Verify a JWT token
+/// Verify a JWT token (internal)
 fn verify_token(token: &str) -> Option<Claims> {
+    let secret = get_or_create_jwt_secret();
+    decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &Validation::default(),
+    )
+    .map(|data| data.claims)
+    .ok()
+}
+
+/// Public test helper: verify a JWT token using a configurable secret
+#[doc(hidden)]
+pub fn verify_token_for_test(token: &str) -> Option<Claims> {
     let secret = get_or_create_jwt_secret();
     decode::<Claims>(
         token,

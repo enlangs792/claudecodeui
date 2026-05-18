@@ -1,7 +1,5 @@
-pub mod traits;
 pub mod registry;
 pub mod routes;
-pub mod services;
 pub mod claude;
 pub mod codex;
 pub mod gemini;

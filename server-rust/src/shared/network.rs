@@ -18,3 +18,44 @@ pub fn get_connectable_host(host: &str) -> String {
         host.into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wildcard_hosts() {
+        assert!(is_wildcard_host("0.0.0.0"));
+        assert!(is_wildcard_host("::"));
+        assert!(!is_wildcard_host("127.0.0.1"));
+        assert!(!is_wildcard_host("192.168.1.1"));
+    }
+
+    #[test]
+    fn test_loopback_hosts() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("127.0.0.1"));
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(!is_loopback_host("example.com"));
+    }
+
+    #[test]
+    fn test_connectable_host_returns_localhost_for_wildcard() {
+        assert_eq!(get_connectable_host("0.0.0.0"), "localhost");
+        assert_eq!(get_connectable_host("::"), "localhost");
+        assert_eq!(get_connectable_host(""), "localhost");
+    }
+
+    #[test]
+    fn test_connectable_host_returns_localhost_for_loopback() {
+        assert_eq!(get_connectable_host("localhost"), "localhost");
+        assert_eq!(get_connectable_host("127.0.0.1"), "localhost");
+    }
+
+    #[test]
+    fn test_connectable_host_passes_through_other_hosts() {
+        assert_eq!(get_connectable_host("example.com"), "example.com");
+        assert_eq!(get_connectable_host("192.168.1.1"), "192.168.1.1");
+    }
+}

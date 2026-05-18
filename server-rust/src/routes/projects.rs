@@ -24,6 +24,7 @@ pub fn routes() -> Router {
         .route("/{project_id}/files/create", post(create_file_or_dir))
         .route("/{project_id}/files/rename", put(rename_file))
         .route("/{project_id}/files", delete(delete_file_or_dir))
+        .route("/{project_id}/sessions/{session_id}/token-usage", get(token_usage))
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,6 +362,249 @@ async fn delete_file_or_dir(
     Ok(Json(json!({
         "success": true,
         "path": resolved.to_string_lossy()
+    })))
+}
+
+// ── Token Usage ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct TokenUsageQuery {
+    provider: Option<String>,
+}
+
+/// GET /api/projects/:project_id/sessions/:session_id/token-usage
+/// Get LLM token usage for a specific session by provider.
+async fn token_usage(
+    Path((project_id, session_id)): Path<(String, String)>,
+    Query(query): Query<TokenUsageQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let provider = query.provider.as_deref().unwrap_or("claude");
+    let home_dir = dirs::home_dir().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot determine home directory"})),
+        )
+    })?;
+
+    // Sanitize session ID (only allow safe characters)
+    let safe_session_id: String = session_id
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+        .collect();
+    if safe_session_id.is_empty() || safe_session_id != session_id {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid sessionId"})),
+        ));
+    }
+
+    match provider {
+        "cursor" | "gemini" => {
+            return Ok(Json(json!({
+                "used": 0,
+                "total": 0,
+                "breakdown": { "input": 0, "cacheCreation": 0, "cacheRead": 0 },
+                "unsupported": true,
+                "message": format!("Token usage tracking not available for {} sessions", provider)
+            })));
+        }
+        "codex" => {
+            handle_codex_token_usage(&home_dir, &safe_session_id).await
+        }
+        _ => {
+            // Default: Claude
+            handle_claude_token_usage(&project_id, &safe_session_id, &home_dir).await
+        }
+    }
+}
+
+/// Scan a directory recursively for a file containing the session ID
+async fn find_session_file_recursive(
+    dir: &std::path::Path,
+    session_id: &str,
+) -> Option<PathBuf> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            if let Some(found) = Box::pin(find_session_file_recursive(&path, session_id)).await {
+                return Some(found);
+            }
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.contains(session_id) && name.ends_with(".jsonl") {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Handle Claude token usage lookup
+async fn handle_claude_token_usage(
+    project_id: &str,
+    session_id: &str,
+    home_dir: &std::path::Path,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Resolve project path from DB
+    let project_path = ProjectsRepo::get_project_path_by_id(project_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Project not found"})),
+        )
+    })?;
+
+    // Encode project path (replace non-alphanumeric chars with -)
+    let encoded: String = project_path
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+
+    let project_dir = home_dir.join(".claude").join("projects").join(&encoded);
+    let jsonl_path = project_dir.join(format!("{}.jsonl", session_id));
+
+    // Path traversal check: ensure resolved path stays within project_dir
+    let canonical_project = std::fs::canonicalize(&project_dir).unwrap_or(project_dir.clone());
+    let canonical_jsonl = std::fs::canonicalize(&jsonl_path).unwrap_or(jsonl_path.clone());
+    if !canonical_jsonl.starts_with(&canonical_project) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Invalid path"})),
+        ));
+    }
+
+    // Read the JSONL file
+    let content = tokio::fs::read_to_string(&jsonl_path).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Session file not found"})),
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    })?;
+
+    // Parse context window from env or use default
+    let context_window = std::env::var("CONTEXT_WINDOW")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(160000);
+
+    let mut input_tokens: i64 = 0;
+    let mut cache_creation_tokens: i64 = 0;
+    let mut cache_read_tokens: i64 = 0;
+
+    // Scan from end for the latest assistant message with usage data
+    let lines: Vec<&str> = content.lines().collect();
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<Value>(trimmed) {
+            if entry["type"].as_str() == Some("assistant") {
+                if let Some(usage) = entry["message"]["usage"].as_object() {
+                    input_tokens = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    cache_creation_tokens = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    cache_read_tokens = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+
+                    // Check for top-level usage fields too (older format)
+                    if input_tokens == 0 {
+                        input_tokens = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let total_used = input_tokens + cache_creation_tokens + cache_read_tokens;
+
+    Ok(Json(json!({
+        "used": total_used,
+        "total": context_window,
+        "breakdown": {
+            "input": input_tokens,
+            "cacheCreation": cache_creation_tokens,
+            "cacheRead": cache_read_tokens
+        }
+    })))
+}
+
+/// Handle Codex token usage lookup
+async fn handle_codex_token_usage(
+    home_dir: &std::path::Path,
+    session_id: &str,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let codex_sessions_dir = home_dir.join(".codex").join("sessions");
+
+    let session_file = find_session_file_recursive(&codex_sessions_dir, session_id).await;
+
+    let session_file = session_file.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Codex session file not found"})),
+        )
+    })?;
+
+    let content = tokio::fs::read_to_string(&session_file).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Session file not found"})),
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        }
+    })?;
+
+    let mut total_tokens: i64 = 0;
+    let mut context_window: i64 = 200000;
+
+    // Scan from end for the latest token_count event
+    let lines: Vec<&str> = content.lines().collect();
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<Value>(trimmed) {
+            if entry["type"].as_str() == Some("event_msg") {
+                if let Some(payload) = entry["payload"].as_object() {
+                    if payload.get("type").and_then(|v| v.as_str()) == Some("token_count") {
+                        if let Some(info) = payload.get("info").and_then(|v| v.as_object()) {
+                            if let Some(total_usage) = info.get("total_token_usage").and_then(|v| v.as_object()) {
+                                total_tokens = total_usage
+                                    .get("total_tokens")
+                                    .and_then(|v| v.as_i64())
+                                    .unwrap_or(0);
+                            }
+                            if let Some(cw) = info.get("model_context_window").and_then(|v| v.as_i64()) {
+                                context_window = cw;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "used": total_tokens,
+        "total": context_window
     })))
 }
 

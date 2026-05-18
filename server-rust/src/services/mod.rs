@@ -1,2 +1,1 @@
-pub mod notifications;
-pub mod vapid;
+pub mod session_manager;
