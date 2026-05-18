@@ -26,7 +26,6 @@ impl ProjectsRepo {
                 });
             let attempted_id = uuid::Uuid::new_v4().to_string();
 
-            // Try INSERT ... ON CONFLICT UPDATE (reactivate archived)
             let result: Option<ProjectRepositoryRow> = db
                 .query_row(
                     "INSERT INTO projects (project_id, project_path, custom_project_name, isArchived)
@@ -146,6 +145,42 @@ impl ProjectsRepo {
         })
     }
 
+    /// List archived projects
+    pub fn list_archived_projects() -> Vec<ProjectRepositoryRow> {
+        connection::with_connection(|db| {
+            let mut stmt = db
+                .prepare(
+                    "SELECT project_id, project_path, custom_project_name, isStarred, isArchived
+                     FROM projects WHERE isArchived = 1 ORDER BY custom_project_name",
+                )
+                .expect("Failed to prepare query");
+            stmt.query_map([], |row| {
+                Ok(ProjectRepositoryRow {
+                    project_id: row.get(0)?,
+                    project_path: row.get(1)?,
+                    custom_project_name: row.get(2)?,
+                    is_starred: row.get(3)?,
+                    is_archived: row.get(4)?,
+                })
+            })
+            .expect("Failed to query archived projects")
+            .filter_map(|r| r.ok())
+            .collect()
+        })
+    }
+
+    /// Update custom project name by ID
+    pub fn update_custom_name_by_id(project_id: &str, name: &str) -> bool {
+        connection::with_connection(|db| {
+            db.execute(
+                "UPDATE projects SET custom_project_name = ?1 WHERE project_id = ?2",
+                params![name, project_id],
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+        })
+    }
+
     /// Toggle star on a project
     pub fn update_star_by_id(project_id: &str, starred: bool) {
         connection::with_connection(|db| {
@@ -174,5 +209,21 @@ impl ProjectsRepo {
             db.execute("DELETE FROM projects WHERE project_id = ?1", params![project_id])
                 .ok();
         });
+    }
+
+    /// Migrate legacy starred project IDs from localStorage
+    pub fn migrate_legacy_stars(project_ids: &[String]) -> usize {
+        connection::with_connection(|db| {
+            let mut updated = 0usize;
+            for pid in project_ids {
+                if let Ok(n) = db.execute(
+                    "UPDATE projects SET isStarred = 1 WHERE project_id = ?1",
+                    params![pid],
+                ) {
+                    updated += n;
+                }
+            }
+            updated
+        })
     }
 }

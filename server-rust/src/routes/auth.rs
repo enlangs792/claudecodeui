@@ -2,7 +2,7 @@
 //!
 //! POST /api/auth/register, login, refresh, logout
 
-use axum::{extract::State, http::StatusCode, response::Json, routing::post, Router, Extension};
+use axum::{extract::State, http::StatusCode, middleware, response::Json, routing::{get, post}, Router, Extension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -15,6 +15,12 @@ pub fn routes() -> Router {
         .route("/login", post(login))
         .route("/refresh", post(refresh))
         .route("/logout", post(logout))
+        .route("/status", get(status))
+        .route(
+            "/user",
+            get(current_user)
+                .layer(middleware::from_fn(crate::auth::middleware::authenticate_token)),
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,4 +128,25 @@ async fn refresh(
 
 async fn logout() -> Json<Value> {
     Json(json!({"success": true, "message": "Logged out successfully"}))
+}
+
+/// GET /api/auth/status — check if setup is needed
+async fn status() -> Json<Value> {
+    let has_users = UserRepo::has_users();
+    Json(json!({
+        "needsSetup": !has_users,
+        "isAuthenticated": false
+    }))
+}
+
+/// GET /api/auth/user — return the current authenticated user
+async fn current_user(
+    Extension(auth_user): Extension<AuthUser>,
+) -> Json<Value> {
+    Json(json!({
+        "user": {
+            "id": auth_user.id,
+            "username": auth_user.username
+        }
+    }))
 }

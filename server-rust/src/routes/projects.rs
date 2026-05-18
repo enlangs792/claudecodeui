@@ -2,29 +2,44 @@
 //! and file operations from server/index.js
 
 use axum::{
-    extract::{Path, Query},
+    extract::{Multipart, Path, Query},
     http::StatusCode,
+    response::sse::{Event, Sse},
     response::Json,
     routing::{delete, get, post, put},
     Router,
 };
+use futures_util::stream::{self, Stream};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::path::PathBuf;
 
-use crate::auth::middleware::AuthUser;
 use crate::db::repos::projects::ProjectsRepo;
+use crate::db::repos::sessions::SessionsRepo;
 use crate::shared::utils;
 
 pub fn routes() -> Router {
     Router::new()
         .route("/", get(list_projects))
+        .route("/archived", get(list_archived_projects))
+        .route("/create-project", post(create_project_handler))
+        .route("/migrate-legacy-stars", post(migrate_legacy_stars))
+        .route("/clone-progress", get(clone_progress))
+        .route("/{project_id}/sessions", get(get_project_sessions))
+        .route("/{project_id}/sessions/{session_id}/token-usage", get(token_usage))
+        .route("/{project_id}/taskmaster", get(get_taskmaster))
+        .route("/{project_id}/rename", put(rename_project))
+        .route("/{project_id}/toggle-star", post(toggle_star))
+        .route("/{project_id}/restore", post(restore_project))
+        .route("/{project_id}/upload-images", post(upload_images))
+        .route("/{project_id}", delete(delete_project))
         .route("/{project_id}/files", get(get_files))
         .route("/{project_id}/file", get(read_file).put(write_file))
         .route("/{project_id}/files/create", post(create_file_or_dir))
         .route("/{project_id}/files/rename", put(rename_file))
+        .route("/{project_id}/files/upload", post(upload_file))
         .route("/{project_id}/files", delete(delete_file_or_dir))
-        .route("/{project_id}/sessions/{session_id}/token-usage", get(token_usage))
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,14 +64,69 @@ struct FileBody {
     path: Option<String>,
 }
 
-// ── GET /api/projects — List all projects ────────────────────────────────────
+// ── GET /api/projects — List all projects with recent sessions ───────
 
 async fn list_projects() -> Json<Value> {
     let projects = ProjectsRepo::list_projects();
-    Json(json!({
-        "success": true,
-        "data": projects
-    }))
+    let items: Vec<Value> = projects
+        .iter()
+        .map(|p| {
+            let display_name = p
+                .custom_project_name
+                .as_ref()
+                .filter(|n| !n.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    std::path::Path::new(&p.project_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&p.project_path)
+                        .to_string()
+                });
+
+            let (rows, has_more, total) =
+                SessionsRepo::list_sessions_paginated(&p.project_path, 20, 0);
+            let mut sessions = Vec::new();
+            let mut cursor = Vec::new();
+            let mut codex = Vec::new();
+            let mut gemini = Vec::new();
+
+            for row in &rows {
+                let s = json!({
+                    "id": row.session_id,
+                    "summary": row.custom_name.clone().unwrap_or_default(),
+                    "messageCount": 0,
+                    "lastActivity": row.updated_at.clone()
+                        .or_else(|| row.created_at.clone())
+                        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                });
+                match row.provider.as_str() {
+                    "cursor" => cursor.push(s),
+                    "codex" => codex.push(s),
+                    "gemini" => gemini.push(s),
+                    _ => sessions.push(s),
+                }
+            }
+
+            json!({
+                "projectId": p.project_id,
+                "path": p.project_path,
+                "displayName": display_name,
+                "fullPath": p.project_path,
+                "isStarred": p.is_starred != 0,
+                "sessions": sessions,
+                "cursorSessions": cursor,
+                "codexSessions": codex,
+                "geminiSessions": gemini,
+                "sessionMeta": {
+                    "hasMore": has_more,
+                    "total": total
+                }
+            })
+        })
+        .collect();
+
+    Json(json!(items))
 }
 
 // ── GET /api/projects/:project_id/files — List file tree ─────────────────────
@@ -606,6 +676,794 @@ async fn handle_codex_token_usage(
         "used": total_tokens,
         "total": context_window
     })))
+}
+
+// ── New Request Types ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateProjectBody {
+    #[serde(rename = "path")]
+    project_path: Option<String>,
+    #[serde(rename = "customName")]
+    custom_name: Option<String>,
+    #[serde(rename = "workspaceType")]
+    workspace_type: Option<Value>,
+    #[serde(rename = "githubUrl")]
+    github_url: Option<String>,
+    #[serde(rename = "githubTokenId")]
+    github_token_id: Option<Value>,
+    #[serde(rename = "newGithubToken")]
+    new_github_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MigrateStarsBody {
+    #[serde(rename = "projectIds")]
+    project_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct CloneProgressQuery {
+    path: Option<String>,
+    #[serde(rename = "githubUrl")]
+    github_url: Option<String>,
+    #[serde(rename = "githubTokenId")]
+    github_token_id: Option<i64>,
+    #[serde(rename = "newGithubToken")]
+    new_github_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameBody {
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteQuery {
+    force: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadImagesBody {
+    images: Option<Vec<String>>,
+}
+
+// ── GET /api/projects/archived — List archived projects with sessions ─────────
+
+async fn list_archived_projects() -> Json<Value> {
+    let projects = ProjectsRepo::list_archived_projects();
+    let items: Vec<Value> = projects
+        .iter()
+        .map(|p| {
+            let display_name = p
+                .custom_project_name
+                .as_ref()
+                .filter(|n| !n.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    std::path::Path::new(&p.project_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&p.project_path)
+                        .to_string()
+                });
+
+            // Fetch ALL sessions (including archived) for archived project view
+            let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>)> =
+                crate::db::connection::with_connection(|db| {
+                    let normalized = crate::shared::utils::normalize_project_path(&p.project_path);
+                    let mut stmt = db
+                        .prepare(
+                            "SELECT session_id, provider, custom_name, created_at, updated_at
+                             FROM sessions WHERE project_path = ?1
+                             ORDER BY updated_at DESC",
+                        )
+                        .ok()?;
+                    let results = stmt
+                        .query_map(rusqlite::params![&normalized], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                            ))
+                        })
+                        .ok()?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Some(results)
+                })
+                .unwrap_or_default();
+
+            let total = rows.len();
+            let mut sessions = Vec::new();
+            let mut cursor = Vec::new();
+            let mut codex = Vec::new();
+            let mut gemini = Vec::new();
+
+            for (session_id, provider, custom_name, created_at, updated_at) in &rows {
+                let s = json!({
+                    "id": session_id,
+                    "summary": custom_name.clone().unwrap_or_default(),
+                    "messageCount": 0,
+                    "lastActivity": updated_at.clone()
+                        .or_else(|| created_at.clone())
+                        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                });
+                match provider.as_str() {
+                    "cursor" => cursor.push(s),
+                    "codex" => codex.push(s),
+                    "gemini" => gemini.push(s),
+                    _ => sessions.push(s),
+                }
+            }
+
+            json!({
+                "projectId": p.project_id,
+                "path": p.project_path,
+                "displayName": display_name,
+                "fullPath": p.project_path,
+                "isStarred": p.is_starred != 0,
+                "isArchived": true,
+                "sessions": sessions,
+                "cursorSessions": cursor,
+                "codexSessions": codex,
+                "geminiSessions": gemini,
+                "sessionMeta": {
+                    "hasMore": false,
+                    "total": total
+                }
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "success": true,
+        "data": { "projects": items }
+    }))
+}
+
+// ── GET /api/projects/:project_id/sessions — Paginated sessions ────────────────
+
+async fn get_project_sessions(
+    Path(project_id): Path<String>,
+    Query(query): Query<SessionsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let project = ProjectsRepo::get_project_by_id(&project_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Project not found", "code": "PROJECT_NOT_FOUND"})),
+        )
+    })?;
+
+    let limit = query.limit.unwrap_or(20).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).max(0);
+
+    let (rows, has_more, total) =
+        SessionsRepo::list_sessions_paginated(&project.project_path, limit, offset);
+    let mut sessions = Vec::new();
+    let mut cursor = Vec::new();
+    let mut codex = Vec::new();
+    let mut gemini = Vec::new();
+
+    for row in &rows {
+        let s = json!({
+            "id": row.session_id,
+            "summary": row.custom_name.clone().unwrap_or_default(),
+            "messageCount": 0,
+            "lastActivity": row.updated_at.clone()
+                .or_else(|| row.created_at.clone())
+                .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+        });
+        match row.provider.as_str() {
+            "cursor" => cursor.push(s),
+            "codex" => codex.push(s),
+            "gemini" => gemini.push(s),
+            _ => sessions.push(s),
+        }
+    }
+
+    Ok(Json(json!({
+        "projectId": project.project_id,
+        "sessions": sessions,
+        "cursorSessions": cursor,
+        "codexSessions": codex,
+        "geminiSessions": gemini,
+        "sessionMeta": {
+            "hasMore": has_more,
+            "total": total
+        }
+    })))
+}
+
+// ── POST /api/projects/create-project — Create a new project ───────────────────
+
+async fn create_project_handler(
+    Json(body): Json<CreateProjectBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Reject legacy workspaceType field
+    if body.workspace_type.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "workspaceType is no longer supported. Use the single create-project flow.",
+                "code": "LEGACY_WORKSPACE_TYPE_UNSUPPORTED"
+            })),
+        ));
+    }
+
+    // Reject clone-related fields
+    if body.github_url.is_some() || body.github_token_id.is_some() || body.new_github_token.is_some()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Repository cloning is not supported on create-project",
+                "code": "CLONE_NOT_SUPPORTED_ON_CREATE_PROJECT",
+                "details": "Use /api/projects/clone-progress for cloning workflows"
+            })),
+        ));
+    }
+
+    let project_path = body.project_path.as_deref().unwrap_or("");
+    let normalized = utils::normalize_project_path(project_path);
+    if normalized.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path is required", "code": "PROJECT_PATH_REQUIRED"})),
+        ));
+    }
+
+    // Validate workspace path
+    let validation = utils::validate_workspace_path(&normalized).await;
+    if !validation.valid {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Invalid project path",
+                "code": "INVALID_PROJECT_PATH",
+                "details": validation.error
+            })),
+        ));
+    }
+
+    let resolved_path = validation.resolved_path.unwrap_or(normalized);
+
+    // Ensure the directory exists
+    tokio::fs::create_dir_all(&resolved_path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    let result = ProjectsRepo::create_project_path(&resolved_path, body.custom_name.as_deref());
+
+    if result.outcome == crate::shared::types::CreateProjectPathOutcome::ActiveConflict {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Project path already exists and is active",
+                "code": "PROJECT_ALREADY_EXISTS",
+                "details": format!("Project path already exists: {}", resolved_path)
+            })),
+        ));
+    }
+
+    let project_row = result
+        .project
+        .or_else(|| ProjectsRepo::get_project_path(&resolved_path))
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "Failed to resolve project after creation",
+                    "code": "PROJECT_CREATE_FAILED"
+                })),
+            )
+        })?;
+
+    let display_name = project_row
+        .custom_project_name
+        .as_ref()
+        .filter(|n| !n.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| {
+            std::path::Path::new(&project_row.project_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&project_row.project_path)
+                .to_string()
+        });
+
+    let outcome_str = match result.outcome {
+        crate::shared::types::CreateProjectPathOutcome::Created => "created",
+        crate::shared::types::CreateProjectPathOutcome::ReactivatedArchived => {
+            "reactivated_archived"
+        }
+        crate::shared::types::CreateProjectPathOutcome::ActiveConflict => "active_conflict",
+    };
+
+    let message = if outcome_str == "reactivated_archived" {
+        "Archived project path reused successfully"
+    } else {
+        "Project created successfully"
+    };
+
+    Ok(Json(json!({
+        "success": true,
+        "project": {
+            "projectId": project_row.project_id,
+            "path": project_row.project_path,
+            "fullPath": project_row.project_path,
+            "displayName": display_name,
+            "customName": project_row.custom_project_name,
+            "isArchived": project_row.is_archived != 0,
+            "isStarred": project_row.is_starred != 0,
+            "sessions": [],
+            "cursorSessions": [],
+            "codexSessions": [],
+            "geminiSessions": [],
+            "sessionMeta": {
+                "hasMore": false,
+                "total": 0
+            }
+        },
+        "message": message
+    })))
+}
+
+// ── POST /api/projects/migrate-legacy-stars — Migrate legacy stars ─────────────
+
+async fn migrate_legacy_stars(Json(body): Json<MigrateStarsBody>) -> Json<Value> {
+    let project_ids = body.project_ids.unwrap_or_default();
+
+    let mut updated = 0usize;
+    for pid in &project_ids {
+        if let Some(project) = ProjectsRepo::get_project_by_id(pid) {
+            if project.is_starred == 0 {
+                ProjectsRepo::update_star_by_id(pid, true);
+                updated += 1;
+            }
+        }
+    }
+
+    Json(json!({
+        "success": true,
+        "updated": updated
+    }))
+}
+
+// ── GET /api/projects/clone-progress — SSE clone progress stub ─────────────────
+
+async fn clone_progress(
+    Query(_query): Query<CloneProgressQuery>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = stream::iter(vec![
+        Ok(Event::default().data(r#"{"type":"progress","message":"Initializing clone..."}"#)),
+        Ok(Event::default()
+            .data(r#"{"type":"progress","message":"Repository cloning is not implemented in the Rust backend yet"}"#)),
+        Ok(Event::default().data(r#"{"type":"error","message":"Clone not available in Rust backend"}"#)),
+    ]);
+
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text(serde_json::json!({"type":"keepalive"}).to_string()),
+    )
+}
+
+// ── GET /api/projects/:project_id/taskmaster — Detect .taskmaster dir ─────────
+
+async fn get_taskmaster(
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let normalized = project_id.trim().to_string();
+    if normalized.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "projectId is required",
+                "code": "PROJECT_ID_REQUIRED"
+            })),
+        ));
+    }
+
+    let project_path = ProjectsRepo::get_project_path_by_id(&normalized).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Project not found",
+                "code": "PROJECT_NOT_FOUND"
+            })),
+        )
+    })?;
+
+    let taskmaster_path = std::path::Path::new(&project_path).join(".taskmaster");
+    let has_taskmaster = taskmaster_path.is_dir();
+
+    let mut has_essential_files = false;
+    let mut metadata = Value::Null;
+
+    if has_taskmaster {
+        let tasks_json = taskmaster_path.join("tasks").join("tasks.json");
+        let _config_json = taskmaster_path.join("config.json");
+        has_essential_files = tasks_json.exists();
+
+        if has_essential_files {
+            match tokio::fs::read_to_string(&tasks_json).await {
+                Ok(content) => {
+                    if let Ok(tasks_data) = serde_json::from_str::<Value>(&content) {
+                        let tasks = tasks_data
+                            .get("tasks")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                let mut all: Vec<Value> = Vec::new();
+                                if let Some(obj) = tasks_data.as_object() {
+                                    for val in obj.values() {
+                                        if let Some(t) = val.get("tasks").and_then(|v| v.as_array())
+                                        {
+                                            all.extend_from_slice(t);
+                                        }
+                                    }
+                                }
+                                all
+                            });
+
+                        let total = tasks.len();
+                        let mut done = 0u64;
+                        let mut pending = 0u64;
+                        let mut in_progress = 0u64;
+                        let mut review = 0u64;
+
+                        for task in &tasks {
+                            match task
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("pending")
+                            {
+                                "done" => done += 1,
+                                "in-progress" => in_progress += 1,
+                                "review" => review += 1,
+                                _ => pending += 1,
+                            }
+                        }
+
+                        let completion_pct =
+                            if total > 0 { (done as f64 / total as f64 * 100.0).round() as i64 } else { 0 };
+
+                        if let Ok(meta) = tokio::fs::metadata(&tasks_json).await {
+                            if let Ok(modified) = meta.modified() {
+                                let dt: chrono::DateTime<chrono::Utc> =
+                                    chrono::DateTime::from(modified);
+                                metadata = json!({
+                                    "taskCount": total,
+                                    "subtaskCount": 0,
+                                    "completed": done,
+                                    "pending": pending,
+                                    "inProgress": in_progress,
+                                    "review": review,
+                                    "completionPercentage": completion_pct,
+                                    "lastModified": dt.to_rfc3339()
+                                });
+                            }
+                        }
+                    } else {
+                        metadata = json!({"error": "Failed to parse tasks.json"});
+                    }
+                }
+                Err(_) => {
+                    metadata = json!({"error": "Failed to read tasks.json"});
+                }
+            }
+        }
+    }
+
+    let status = if has_taskmaster && has_essential_files {
+        "configured"
+    } else {
+        "not-configured"
+    };
+
+    Ok(Json(json!({
+        "projectId": project_id,
+        "projectPath": project_path,
+        "taskmaster": {
+            "hasTaskmaster": has_taskmaster,
+            "hasEssentialFiles": has_essential_files,
+            "metadata": metadata,
+            "status": status
+        }
+    })))
+}
+
+// ── PUT /api/projects/:project_id/rename — Rename project ──────────────────────
+
+async fn rename_project(
+    Path(project_id): Path<String>,
+    Json(body): Json<RenameBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let project = ProjectsRepo::get_project_by_id(&project_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Project not found"})),
+        )
+    })?;
+
+    let name = body.display_name.as_deref().unwrap_or("");
+    let trimmed = name.trim();
+
+    if trimmed.is_empty() {
+        let basename = std::path::Path::new(&project.project_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&project.project_path)
+            .to_string();
+        ProjectsRepo::update_custom_name_by_id(&project_id, &basename);
+    } else {
+        ProjectsRepo::update_custom_name_by_id(&project_id, trimmed);
+    }
+
+    Ok(Json(json!({"success": true})))
+}
+
+// ── POST /api/projects/:project_id/toggle-star — Toggle star ──────────────────
+
+async fn toggle_star(
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let normalized = project_id.trim().to_string();
+    if normalized.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "projectId is required",
+                "code": "PROJECT_ID_REQUIRED"
+            })),
+        ));
+    }
+
+    let project = ProjectsRepo::get_project_by_id(&normalized).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Project not found",
+                "code": "PROJECT_NOT_FOUND"
+            })),
+        )
+    })?;
+
+    let next_starred = project.is_starred == 0;
+    ProjectsRepo::update_star_by_id(&normalized, next_starred);
+
+    Ok(Json(json!({
+        "success": true,
+        "isStarred": next_starred
+    })))
+}
+
+// ── POST /api/projects/:project_id/restore — Restore from archive ──────────────
+
+async fn restore_project(
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let project = ProjectsRepo::get_project_by_id(&project_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Unknown projectId",
+                "code": "PROJECT_NOT_FOUND"
+            })),
+        )
+    })?;
+
+    ProjectsRepo::update_archive_by_id(&project_id, false);
+
+    Ok(Json(json!({
+        "success": true,
+        "data": {
+            "projectId": project.project_id,
+            "isArchived": false
+        }
+    })))
+}
+
+// ── DELETE /api/projects/:project_id — Delete or archive ──────────────────────
+
+async fn delete_project(
+    Path(project_id): Path<String>,
+    Query(query): Query<DeleteQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let project = ProjectsRepo::get_project_by_id(&project_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "Unknown projectId",
+                "code": "PROJECT_NOT_FOUND"
+            })),
+        )
+    })?;
+
+    let force = query.force.as_deref() == Some("true");
+
+    if !force {
+        // Soft delete: set archived flag
+        ProjectsRepo::update_archive_by_id(&project_id, true);
+    } else {
+        // Force delete: remove JSONL files, session rows, and project row
+        let sessions = SessionsRepo::list_sessions(Some(&project.project_path));
+        for session in &sessions {
+            if let Some(ref jsonl_path) = session.jsonl_path {
+                let path = std::path::Path::new(jsonl_path);
+                if path.exists() {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
+            }
+        }
+
+        // Delete all session rows for this project path
+        let normalized = utils::normalize_project_path(&project.project_path);
+        crate::db::connection::with_connection(|db| {
+            db.execute(
+                "DELETE FROM sessions WHERE project_path = ?1",
+                rusqlite::params![&normalized],
+            )
+            .ok();
+        });
+
+        // Delete project row
+        ProjectsRepo::delete_by_id(&project_id);
+    }
+
+    Ok(Json(json!({"success": true})))
+}
+
+// ── POST /api/projects/:project_id/upload-images — Upload base64 images ───────
+
+async fn upload_images(
+    Path(project_id): Path<String>,
+    Json(body): Json<UploadImagesBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let project_path = ProjectsRepo::get_project_path_by_id(&project_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Project not found"})),
+        )
+    })?;
+
+    let images = body.images.unwrap_or_default();
+    let upload_dir = std::path::Path::new(&project_path).join(".uploads");
+    tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    use base64::Engine;
+    let mut uploaded = Vec::new();
+    for (i, img) in images.iter().enumerate() {
+        let data = if let Some(stripped) = img.strip_prefix("data:image/") {
+            // data:image/png;base64,<actual_data>
+            if let Some(comma_pos) = stripped.find(',') {
+                &stripped[comma_pos + 1..]
+            } else {
+                img
+            }
+        } else {
+            img
+        };
+
+        let decoded = base64::engine::general_purpose::STANDARD.decode(data).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid base64 image at index {}", i)})),
+            )
+        })?;
+
+        let ext = image_ext_from_bytes(&decoded);
+        let filename = format!("{}_{}.{}", chrono::Utc::now().timestamp_micros(), i, ext);
+        let filepath = upload_dir.join(&filename);
+
+        tokio::fs::write(&filepath, &decoded).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+        uploaded.push(json!({
+            "url": format!("/uploads/{}", filename),
+            "path": filepath.to_string_lossy(),
+            "filename": filename
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "images": uploaded
+    })))
+}
+
+/// POST /{project_id}/files/upload — multipart file upload
+async fn upload_file(
+    Path(project_id): Path<String>,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let project_path = ProjectsRepo::get_project_path_by_id(&project_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "Project not found"})),
+        )
+    })?;
+
+    let mut uploaded = Vec::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let file_name = field.file_name().unwrap_or("unnamed").to_string();
+        let content = field.bytes().await.map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Failed to read file data"})),
+            )
+        })?;
+
+        // Strip path separators from filename for safety
+        let safe_name = file_name.replace('/', "_").replace('\\', "_");
+        let upload_dir = std::path::Path::new(&project_path).join(".uploads");
+        tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+        let file_path = upload_dir.join(&safe_name);
+        tokio::fs::write(&file_path, &content).await.map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+
+        uploaded.push(json!({
+            "filename": safe_name,
+            "path": file_path.to_string_lossy(),
+            "size": content.len(),
+        }));
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "files": uploaded
+    })))
+}
+
+/// Determine image file extension from magic bytes
+fn image_ext_from_bytes(bytes: &[u8]) -> &'static str {
+    if bytes.len() < 4 {
+        return "png";
+    }
+    if bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF {
+        "jpg"
+    } else if bytes[0] == 0x89 && bytes[1] == b'P' && bytes[2] == b'N' && bytes[3] == b'G' {
+        "png"
+    } else if bytes[0] == b'G' && bytes[1] == b'I' && bytes[2] == b'F' {
+        "gif"
+    } else if bytes[0] == 0x52 && bytes[1] == 0x49 && bytes[2] == 0x46 && bytes[3] == 0x46 {
+        "webp"
+    } else {
+        "png"
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

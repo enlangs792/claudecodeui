@@ -7,20 +7,23 @@ mod services;
 mod shared;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use axum::{
     http::StatusCode,
     middleware, response::Json,
-    routing::get,
-    Router,
+    routing::{get, post},
+    Extension, Router,
 };
 use serde_json::{json, Value};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing_subscriber::{EnvFilter, fmt};
 
+use crate::auth::middleware::AuthUser;
 use crate::db::migrations::initialize_database;
 use crate::db::connection::get_connection;
 use crate::auth::middleware as auth_mw;
+use crate::providers::registry::ProviderRegistry;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
         .nest("/cursor", routes::cursor::routes())
         .nest("/gemini", routes::gemini::routes())
         .nest("/plugins", routes::plugins::routes())
+        .nest("/providers", providers::routes::routes().with_state(Arc::new(ProviderRegistry::new())))
+        .route("/system/update", post(system_update))
         .merge(routes::filesystem::routes());
     protected = protected.layer(middleware::from_fn(auth_mw::authenticate_token));
 
@@ -100,6 +105,16 @@ async fn main() -> anyhow::Result<()> {
                                 return Ok::<_, std::convert::Infallible>(resp);
                             }
                         }
+                    }
+
+                    // API routes that aren't matched should return 404, not the SPA
+                    if uri_path.starts_with("api/") {
+                        let resp = axum::http::Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header("Content-Type", "application/json")
+                            .body(axum::body::Body::from(r#"{"error":"Not found"}"#))
+                            .unwrap();
+                        return Ok(resp);
                     }
 
                     // SPA fallback: serve dist/index.html for non-file routes (no extension)
@@ -185,6 +200,72 @@ async fn health_check() -> Json<Value> {
         "installMode": "git",
         "server": "rust"
     }))
+}
+
+/// POST /api/system/update — run system update (git pull or npm update)
+/// Mirrors server/index.js lines 215-286.
+async fn system_update(
+    Extension(_user): Extension<AuthUser>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let app_root = find_app_root();
+    let is_platform = crate::shared::config::IS_PLATFORM;
+    let is_git = app_root.join(".git").exists();
+
+    let (update_command, update_cwd) = if is_platform {
+        ("npm run update:platform".to_string(), app_root.clone())
+    } else if is_git {
+        (
+            "git checkout main && git pull && npm install".to_string(),
+            app_root,
+        )
+    } else {
+        (
+            "npm install -g @cloudcli-ai/cloudcli@latest".to_string(),
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+        )
+    };
+
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&update_command)
+        .current_dir(&update_cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Failed to spawn update: {}", e)})),
+            )
+        })?;
+
+    let output = child.wait_with_output().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok(Json(json!({
+            "success": true,
+            "output": if stdout.is_empty() { "Update completed successfully".to_string() } else { stdout },
+            "message": "Update completed. Please restart the server to apply changes."
+        })))
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "success": false,
+                "error": "Update command failed",
+                "output": stdout,
+                "errorOutput": stderr
+            })),
+        ))
+    }
 }
 
 /// Find the application root directory (parent of server-rust/).
