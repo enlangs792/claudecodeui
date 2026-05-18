@@ -21,7 +21,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::auth::middleware::AuthUser;
 use crate::db::migrations::initialize_database;
-use crate::db::connection::get_connection;
+use crate::db::connection::init_pool;
 use crate::auth::middleware as auth_mw;
 use crate::providers::registry::ProviderRegistry;
 
@@ -31,12 +31,9 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    // Initialize database schema and run migrations
-    {
-        let guard = get_connection();
-        let conn = guard.as_ref().expect("Database not initialized");
-        initialize_database(conn);
-    }
+    // Initialize database pool and run migrations
+    init_pool();
+    initialize_database();
 
     let app_root = find_app_root();
     tracing::info!("App root resolved to: {}", app_root.display());

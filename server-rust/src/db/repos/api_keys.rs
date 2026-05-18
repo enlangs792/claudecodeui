@@ -1,7 +1,9 @@
-//! API Keys repository — mirrors server/modules/database/repositories/api-keys.ts
+//! API Keys repository — Diesel implementation
 
-use rusqlite::params;
+use diesel::prelude::*;
 use crate::db::connection;
+use crate::db::models;
+use crate::db::schema::api_keys;
 
 #[derive(Debug, Clone)]
 pub struct ApiKeyRow {
@@ -9,83 +11,93 @@ pub struct ApiKeyRow {
     pub user_id: i64,
     pub key_name: String,
     pub api_key: String,
-    pub created_at: String,
-    pub last_used: Option<String>,
-    pub is_active: i32,
+    pub created_at: Option<chrono::NaiveDateTime>,
+    pub last_used: Option<chrono::NaiveDateTime>,
+    pub is_active: bool,
+}
+
+impl From<models::ApiKey> for ApiKeyRow {
+    fn from(k: models::ApiKey) -> Self {
+        ApiKeyRow {
+            id: k.id,
+            user_id: k.user_id,
+            key_name: k.key_name,
+            api_key: k.api_key,
+            created_at: k.created_at,
+            last_used: k.last_used,
+            is_active: k.is_active,
+        }
+    }
 }
 
 pub struct ApiKeysRepo;
 
 impl ApiKeysRepo {
-    /// Create a new API key
     pub fn create(user_id: i64, key_name: &str, api_key: &str) -> i64 {
-        connection::with_connection(|db| {
-            db.execute(
-                "INSERT INTO api_keys (user_id, key_name, api_key) VALUES (?1, ?2, ?3)",
-                params![user_id, key_name, api_key],
-            )
-            .expect("Failed to create API key");
-            db.last_insert_rowid()
+        connection::with_db(|conn| {
+            use api_keys::dsl;
+
+            let new_key = models::NewApiKey {
+                user_id,
+                key_name: key_name.to_string(),
+                api_key: api_key.to_string(),
+            };
+
+            diesel::insert_into(api_keys::table)
+                .values(&new_key)
+                .returning(api_keys::id)
+                .get_result::<i64>(conn)
+                .expect("Failed to create API key")
         })
     }
 
-    /// Validate an API key and update last_used
-    pub fn validate(api_key: &str) -> Option<i64> {
-        connection::with_connection(|db| {
-            let user_id: Option<i64> = db
-                .query_row(
-                    "SELECT user_id FROM api_keys WHERE api_key = ?1 AND is_active = 1",
-                    params![api_key],
-                    |row| row.get(0),
-                )
+    pub fn validate(api_key_str: &str) -> Option<i64> {
+        connection::with_db(|conn| {
+            use api_keys::dsl;
+
+            let result: Option<i64> = dsl::api_keys
+                .filter(dsl::api_key.eq(api_key_str))
+                .filter(dsl::is_active.eq(true))
+                .select(dsl::user_id)
+                .first(conn)
                 .ok();
 
-            if let Some(uid) = user_id {
-                db.execute(
-                    "UPDATE api_keys SET last_used = CURRENT_TIMESTAMP WHERE api_key = ?1",
-                    params![api_key],
+            if result.is_some() {
+                let now = chrono::Utc::now().naive_utc();
+                diesel::update(
+                    dsl::api_keys.filter(dsl::api_key.eq(api_key_str)),
                 )
+                .set(dsl::last_used.eq(Some(now)))
+                .execute(conn)
                 .ok();
             }
 
-            user_id
+            result
         })
     }
 
-    /// List API keys for a user
     pub fn list_by_user(user_id: i64) -> Vec<ApiKeyRow> {
-        connection::with_connection(|db| {
-            let mut stmt = db
-                .prepare(
-                    "SELECT id, user_id, key_name, api_key, created_at, last_used, is_active
-                     FROM api_keys WHERE user_id = ?1 AND is_active = 1 ORDER BY created_at DESC",
-                )
-                .expect("Failed to prepare query");
-            stmt.query_map(params![user_id], |row| {
-                Ok(ApiKeyRow {
-                    id: row.get(0)?,
-                    user_id: row.get(1)?,
-                    key_name: row.get(2)?,
-                    api_key: row.get(3)?,
-                    created_at: row.get(4)?,
-                    last_used: row.get(5)?,
-                    is_active: row.get(6)?,
-                })
-            })
-            .expect("Failed to list API keys")
-            .filter_map(|r| r.ok())
-            .collect()
+        connection::with_db(|conn| {
+            use api_keys::dsl;
+            dsl::api_keys
+                .filter(dsl::user_id.eq(user_id))
+                .filter(dsl::is_active.eq(true))
+                .order(dsl::created_at.desc())
+                .load::<models::ApiKey>(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(ApiKeyRow::from)
+                .collect()
         })
     }
 
-    /// Deactivate an API key
     pub fn deactivate(key_id: i64) {
-        connection::with_connection(|db| {
-            db.execute(
-                "UPDATE api_keys SET is_active = 0 WHERE id = ?1",
-                params![key_id],
-            )
-            .ok();
+        connection::with_db(|conn| {
+            use api_keys::dsl;
+            diesel::update(dsl::api_keys.filter(dsl::id.eq(key_id)))
+                .set(dsl::is_active.eq(false))
+                .execute(conn)
+                .ok();
         });
     }
 }

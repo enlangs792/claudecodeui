@@ -1,7 +1,10 @@
-//! Sessions repository — mirrors server/modules/database/repositories/sessions.db.ts
+//! Sessions repository — Diesel implementation
 
-use rusqlite::params;
-use crate::db::{connection, repos::projects::ProjectsRepo};
+use diesel::prelude::*;
+use crate::db::connection;
+use crate::db::models;
+use crate::db::schema::sessions;
+use crate::db::repos::projects::ProjectsRepo;
 
 #[derive(Debug, Clone)]
 pub struct SessionRow {
@@ -10,12 +13,26 @@ pub struct SessionRow {
     pub project_path: Option<String>,
     pub jsonl_path: Option<String>,
     pub custom_name: Option<String>,
-    pub is_archived: i32,
-    pub created_at: Option<String>,
-    pub updated_at: Option<String>,
+    pub is_archived: bool,
+    pub created_at: Option<chrono::NaiveDateTime>,
+    pub updated_at: Option<chrono::NaiveDateTime>,
 }
 
-/// Lightweight session summary for project listing
+impl From<models::Session> for SessionRow {
+    fn from(s: models::Session) -> Self {
+        SessionRow {
+            session_id: s.session_id,
+            provider: s.provider,
+            project_path: s.project_path,
+            jsonl_path: s.jsonl_path,
+            custom_name: s.custom_name,
+            is_archived: s.is_archived,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SessionSummary {
     pub id: String,
@@ -24,13 +41,12 @@ pub struct SessionSummary {
     #[serde(rename = "messageCount")]
     pub message_count: i64,
     #[serde(rename = "lastActivity")]
-    pub last_activity: Option<String>,
+    pub last_activity: Option<chrono::NaiveDateTime>,
 }
 
 pub struct SessionsRepo;
 
 impl SessionsRepo {
-    /// Upsert a session record
     pub fn upsert(
         session_id: &str,
         provider: &str,
@@ -38,85 +54,81 @@ impl SessionsRepo {
         custom_name: Option<&str>,
         jsonl_path: Option<&str>,
     ) -> String {
-        connection::with_connection(|db| {
+        connection::with_db(|conn| {
+            use sessions::dsl;
+
             let normalized_path = crate::shared::utils::normalize_project_path(project_path);
 
             // Ensure the project exists first (foreign key)
             ProjectsRepo::create_project_path(&normalized_path, None);
 
-            db.execute(
-                "INSERT INTO sessions (session_id, provider, custom_name, project_path, jsonl_path, isArchived)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                   provider = excluded.provider,
-                   updated_at = CURRENT_TIMESTAMP,
-                   project_path = excluded.project_path,
-                   jsonl_path = excluded.jsonl_path,
-                   isArchived = 0,
-                   custom_name = COALESCE(excluded.custom_name, sessions.custom_name)",
-                params![session_id, provider, custom_name, normalized_path, jsonl_path],
-            )
-            .expect("Failed to upsert session");
+            let new_session = models::NewSession {
+                session_id: session_id.to_string(),
+                provider: provider.to_string(),
+                custom_name: custom_name.map(String::from),
+                project_path: if normalized_path.is_empty() {
+                    None
+                } else {
+                    Some(normalized_path)
+                },
+                jsonl_path: jsonl_path.map(String::from),
+            };
+
+            diesel::insert_into(sessions::table)
+                .values(&new_session)
+                .on_conflict(dsl::session_id)
+                .do_update()
+                .set((
+                    dsl::provider.eq(provider.to_string()),
+                    dsl::updated_at.eq(chrono::Utc::now().naive_utc()),
+                    dsl::project_path.eq(new_session.project_path.clone()),
+                    dsl::jsonl_path.eq(new_session.jsonl_path.clone()),
+                    dsl::isArchived.eq(false),
+                    dsl::custom_name.eq(new_session.custom_name.clone()),
+                ))
+                .execute(conn)
+                .expect("Failed to upsert session");
+
             session_id.to_string()
         })
     }
 
-    /// Get a session by ID
     pub fn get_by_id(session_id: &str) -> Option<SessionRow> {
-        connection::with_connection(|db| {
-            db.query_row(
-                "SELECT session_id, provider, project_path, jsonl_path, custom_name, isArchived, created_at, updated_at
-                 FROM sessions WHERE session_id = ?1 ORDER BY updated_at DESC LIMIT 1",
-                params![session_id],
-                |row| {
-                    Ok(SessionRow {
-                        session_id: row.get(0)?,
-                        provider: row.get(1)?,
-                        project_path: row.get(2)?,
-                        jsonl_path: row.get(3)?,
-                        custom_name: row.get(4)?,
-                        is_archived: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
-                    })
-                },
-            )
-            .ok()
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            dsl::sessions
+                .filter(dsl::session_id.eq(session_id))
+                .order(dsl::updated_at.desc())
+                .first::<models::Session>(conn)
+                .ok()
+                .map(SessionRow::from)
         })
     }
 
-    /// Update session custom name
     pub fn update_custom_name(session_id: &str, custom_name: &str) {
-        connection::with_connection(|db| {
-            db.execute(
-                "UPDATE sessions SET custom_name = ?1 WHERE session_id = ?2",
-                params![custom_name, session_id],
-            )
-            .ok();
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            diesel::update(dsl::sessions.filter(dsl::session_id.eq(session_id)))
+                .set((
+                    dsl::custom_name.eq(Some(custom_name.to_string())),
+                    dsl::updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)
+                .ok();
         });
     }
 
-    /// List sessions (optionally filtered by project_path)
     pub fn list_sessions(project_path: Option<&str>) -> Vec<SessionRow> {
-        connection::with_connection(|db| {
-            let query = "SELECT session_id, provider, project_path, jsonl_path, custom_name, isArchived, created_at, updated_at
-                         FROM sessions WHERE isArchived = 0 ORDER BY updated_at DESC";
-            let mut stmt = db.prepare(query).expect("Failed to prepare query");
-            let rows: Vec<SessionRow> = stmt
-                .query_map([], |row| {
-                    Ok(SessionRow {
-                        session_id: row.get(0)?,
-                        provider: row.get(1)?,
-                        project_path: row.get(2)?,
-                        jsonl_path: row.get(3)?,
-                        custom_name: row.get(4)?,
-                        is_archived: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
-                    })
-                })
-                .expect("Failed to list sessions")
-                .filter_map(|r| r.ok())
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            let query = dsl::sessions
+                .filter(dsl::isArchived.eq(false))
+                .order(dsl::updated_at.desc());
+            let rows: Vec<SessionRow> = query
+                .load::<models::Session>(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(SessionRow::from)
                 .collect();
 
             if let Some(path) = project_path {
@@ -130,47 +142,32 @@ impl SessionsRepo {
         })
     }
 
-    /// List sessions by project path with pagination
     pub fn list_sessions_paginated(
         project_path: &str,
         limit: i64,
         offset: i64,
     ) -> (Vec<SessionRow>, bool, i64) {
-        connection::with_connection(|db| {
+        connection::with_db(|conn| {
+            use sessions::dsl;
             let normalized = crate::shared::utils::normalize_project_path(project_path);
 
-            // Count total
-            let total: i64 = db
-                .query_row(
-                    "SELECT COUNT(*) FROM sessions WHERE project_path = ?1 AND isArchived = 0",
-                    params![&normalized],
-                    |row| row.get(0),
-                )
+            let total: i64 = dsl::sessions
+                .filter(dsl::project_path.eq(&normalized))
+                .filter(dsl::isArchived.eq(false))
+                .select(diesel::dsl::count(dsl::session_id))
+                .first(conn)
                 .unwrap_or(0);
 
-            let mut stmt = db
-                .prepare(
-                    "SELECT session_id, provider, project_path, jsonl_path, custom_name, isArchived, created_at, updated_at
-                     FROM sessions WHERE project_path = ?1 AND isArchived = 0
-                     ORDER BY updated_at DESC LIMIT ?2 OFFSET ?3",
-                )
-                .expect("Failed to prepare query");
-
-            let rows: Vec<SessionRow> = stmt
-                .query_map(params![&normalized, limit, offset], |row| {
-                    Ok(SessionRow {
-                        session_id: row.get(0)?,
-                        provider: row.get(1)?,
-                        project_path: row.get(2)?,
-                        jsonl_path: row.get(3)?,
-                        custom_name: row.get(4)?,
-                        is_archived: row.get(5)?,
-                        created_at: row.get(6)?,
-                        updated_at: row.get(7)?,
-                    })
-                })
-                .expect("Failed to list paginated sessions")
-                .filter_map(|r| r.ok())
+            let rows: Vec<SessionRow> = dsl::sessions
+                .filter(dsl::project_path.eq(&normalized))
+                .filter(dsl::isArchived.eq(false))
+                .order(dsl::updated_at.desc())
+                .limit(limit)
+                .offset(offset)
+                .load::<models::Session>(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(SessionRow::from)
                 .collect();
 
             let has_more = (offset + limit) < total;
@@ -178,99 +175,88 @@ impl SessionsRepo {
         })
     }
 
-    /// List archived sessions
     pub fn list_archived_sessions() -> Vec<SessionRow> {
-        connection::with_connection(|db| {
-            let mut stmt = db
-                .prepare(
-                    "SELECT session_id, provider, project_path, jsonl_path, custom_name, isArchived, created_at, updated_at
-                     FROM sessions WHERE isArchived = 1 ORDER BY updated_at DESC",
-                )
-                .expect("Failed to prepare query");
-            stmt.query_map([], |row| {
-                Ok(SessionRow {
-                    session_id: row.get(0)?,
-                    provider: row.get(1)?,
-                    project_path: row.get(2)?,
-                    jsonl_path: row.get(3)?,
-                    custom_name: row.get(4)?,
-                    is_archived: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                })
-            })
-            .expect("Failed to list archived sessions")
-            .filter_map(|r| r.ok())
-            .collect()
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            dsl::sessions
+                .filter(dsl::isArchived.eq(true))
+                .order(dsl::updated_at.desc())
+                .load::<models::Session>(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(SessionRow::from)
+                .collect()
         })
     }
 
-    /// Archive a session
     pub fn archive(session_id: &str) {
-        connection::with_connection(|db| {
-            db.execute(
-                "UPDATE sessions SET isArchived = 1 WHERE session_id = ?1",
-                params![session_id],
-            )
-            .ok();
-        });
-    }
-
-    /// Restore a session from archive
-    pub fn restore(session_id: &str) {
-        connection::with_connection(|db| {
-            db.execute(
-                "UPDATE sessions SET isArchived = 0 WHERE session_id = ?1",
-                params![session_id],
-            )
-            .ok();
-        });
-    }
-
-    /// Delete a session by ID
-    pub fn delete_by_id(session_id: &str) {
-        connection::with_connection(|db| {
-            db.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            diesel::update(dsl::sessions.filter(dsl::session_id.eq(session_id)))
+                .set((
+                    dsl::isArchived.eq(true),
+                    dsl::updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)
                 .ok();
         });
     }
 
-    /// Get session summaries for a project path (for ProjectListItem)
-    pub fn get_session_summaries(project_path: &str) -> Vec<SessionSummary> {
-        connection::with_connection(|db| {
-            let normalized = crate::shared::utils::normalize_project_path(project_path);
-            let mut stmt = db
-                .prepare(
-                    "SELECT session_id, custom_name, updated_at
-                     FROM sessions WHERE project_path = ?1 AND isArchived = 0
-                     ORDER BY updated_at DESC",
-                )
-                .expect("Failed to prepare query");
+    pub fn restore(session_id: &str) {
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            diesel::update(dsl::sessions.filter(dsl::session_id.eq(session_id)))
+                .set((
+                    dsl::isArchived.eq(false),
+                    dsl::updated_at.eq(chrono::Utc::now().naive_utc()),
+                ))
+                .execute(conn)
+                .ok();
+        });
+    }
 
-            stmt.query_map(params![&normalized], |row| {
-                Ok(SessionSummary {
-                    id: row.get(0)?,
-                    summary: row.get(1)?,
-                    message_count: 0, // JSONL parsing would be expensive; frontend can lazy-load
-                    last_activity: row.get(2)?,
+    pub fn delete_by_id(session_id: &str) {
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            diesel::delete(dsl::sessions.filter(dsl::session_id.eq(session_id)))
+                .execute(conn)
+                .ok();
+        });
+    }
+
+    pub fn get_session_summaries(project_path: &str) -> Vec<SessionSummary> {
+        connection::with_db(|conn| {
+            use sessions::dsl;
+            let normalized = crate::shared::utils::normalize_project_path(project_path);
+
+            dsl::sessions
+                .filter(dsl::project_path.eq(&normalized))
+                .filter(dsl::isArchived.eq(false))
+                .order(dsl::updated_at.desc())
+                .select((dsl::session_id, dsl::custom_name, dsl::updated_at))
+                .load::<(String, Option<String>, Option<chrono::NaiveDateTime>)>(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, summary, last_activity)| SessionSummary {
+                    id,
+                    summary,
+                    message_count: 0,
+                    last_activity,
                 })
-            })
-            .expect("Failed to get session summaries")
-            .filter_map(|r| r.ok())
-            .collect()
+                .collect()
         })
     }
 
-    /// Count sessions for a project path
     pub fn count_by_project_path(project_path: &str) -> i64 {
-        connection::with_connection(|db| {
+        connection::with_db(|conn| {
+            use sessions::dsl;
             let normalized = crate::shared::utils::normalize_project_path(project_path);
-            db.query_row(
-                "SELECT COUNT(*) FROM sessions WHERE project_path = ?1 AND isArchived = 0",
-                params![&normalized],
-                |row| row.get(0),
-            )
-            .unwrap_or(0)
+            dsl::sessions
+                .filter(dsl::project_path.eq(&normalized))
+                .filter(dsl::isArchived.eq(false))
+                .select(diesel::dsl::count(dsl::session_id))
+                .first(conn)
+                .unwrap_or(0)
         })
     }
 }

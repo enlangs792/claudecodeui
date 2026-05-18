@@ -1,19 +1,31 @@
-//! Projects repository — mirrors server/modules/database/repositories/projects.db.ts
+//! Projects repository — Diesel implementation
 
-use rusqlite::params;
-
+use diesel::prelude::*;
 use crate::db::connection;
+use crate::db::models;
+use crate::db::schema::projects;
 use crate::shared::types::{CreateProjectPathOutcome, CreateProjectPathResult, ProjectRepositoryRow};
+
+fn to_repo_row(p: models::Project) -> ProjectRepositoryRow {
+    ProjectRepositoryRow {
+        project_id: p.project_id,
+        project_path: p.project_path,
+        custom_project_name: p.custom_project_name,
+        is_starred: p.is_starred as i32,
+        is_archived: p.is_archived as i32,
+    }
+}
 
 pub struct ProjectsRepo;
 
 impl ProjectsRepo {
-    /// Create or reactivate a project path
     pub fn create_project_path(
         project_path: &str,
         custom_project_name: Option<&str>,
     ) -> CreateProjectPathResult {
-        connection::with_connection(|db| {
+        connection::with_db(|conn| {
+            use projects::dsl;
+
             let normalized_path = crate::shared::utils::normalize_project_path(project_path);
             let display_name = custom_project_name
                 .map(|n| n.trim())
@@ -26,200 +38,238 @@ impl ProjectsRepo {
                 });
             let attempted_id = uuid::Uuid::new_v4().to_string();
 
-            let result: Option<ProjectRepositoryRow> = db
-                .query_row(
-                    "INSERT INTO projects (project_id, project_path, custom_project_name, isArchived)
-                     VALUES (?1, ?2, ?3, 0)
-                     ON CONFLICT(project_path) DO UPDATE SET isArchived = 0
-                     WHERE projects.isArchived = 1
-                     RETURNING project_id, project_path, custom_project_name, isStarred, isArchived",
-                    params![attempted_id, normalized_path, display_name],
-                    |row| {
-                        Ok(ProjectRepositoryRow {
-                            project_id: row.get(0)?,
-                            project_path: row.get(1)?,
-                            custom_project_name: row.get(2)?,
-                            is_starred: row.get(3)?,
-                            is_archived: row.get(4)?,
-                        })
-                    },
-                )
-                .ok();
+            // Try inserting a new project first
+            let insert_result = diesel::insert_into(projects::table)
+                .values(&models::NewProject {
+                    project_id: attempted_id.clone(),
+                    project_path: normalized_path.clone(),
+                    custom_project_name: Some(display_name.to_string()),
+                })
+                .returning((
+                    dsl::project_id,
+                    dsl::project_path,
+                    dsl::custom_project_name,
+                    dsl::isStarred,
+                    dsl::isArchived,
+                ))
+                .get_result::<(String, String, Option<String>, bool, bool)>(conn);
 
-            if let Some(row) = result {
-                return CreateProjectPathResult {
-                    outcome: if row.project_id == attempted_id {
-                        CreateProjectPathOutcome::Created
-                    } else {
-                        CreateProjectPathOutcome::ReactivatedArchived
-                    },
-                    project: Some(row),
-                };
-            }
-
-            // Conflicting active project
-            let existing = Self::get_project_path(&normalized_path);
-            CreateProjectPathResult {
-                outcome: CreateProjectPathOutcome::ActiveConflict,
-                project: existing,
+            match insert_result {
+                Ok((pid, pp, cpn, is_starred, is_archived)) => {
+                    let row = ProjectRepositoryRow {
+                        project_id: pid,
+                        project_path: pp,
+                        custom_project_name: cpn,
+                        is_starred: is_starred as i32,
+                        is_archived: is_archived as i32,
+                    };
+                    let is_new = row.project_id == attempted_id;
+                    if !is_new {
+                        // Was reactivated via conflict resolution
+                        // We need to handle the ON CONFLICT DO UPDATE separately
+                        diesel::update(dsl::projects.filter(dsl::project_path.eq(&normalized_path)))
+                            .set(dsl::isArchived.eq(false))
+                            .execute(conn)
+                            .ok();
+                    }
+                    CreateProjectPathResult {
+                        outcome: if is_new {
+                            CreateProjectPathOutcome::Created
+                        } else {
+                            CreateProjectPathOutcome::ReactivatedArchived
+                        },
+                        project: Some(row),
+                    }
+                }
+                Err(diesel::result::Error::NotFound) => {
+                    // Conflicting active project
+                    let existing = Self::get_project_path_internal(conn, &normalized_path);
+                    CreateProjectPathResult {
+                        outcome: CreateProjectPathOutcome::ActiveConflict,
+                        project: existing,
+                    }
+                }
+                Err(_) => {
+                    let existing = Self::get_project_path_internal(conn, &normalized_path);
+                    CreateProjectPathResult {
+                        outcome: CreateProjectPathOutcome::ActiveConflict,
+                        project: existing,
+                    }
+                }
             }
         })
     }
 
-    /// Get project by path
+    fn get_project_path_internal(
+        conn: &mut diesel::SqliteConnection,
+        normalized_path: &str,
+    ) -> Option<ProjectRepositoryRow> {
+        use projects::dsl;
+        dsl::projects
+            .filter(dsl::project_path.eq(normalized_path))
+            .select((
+                dsl::project_id,
+                dsl::project_path,
+                dsl::custom_project_name,
+                dsl::isStarred,
+                dsl::isArchived,
+            ))
+            .first::<(String, String, Option<String>, bool, bool)>(conn)
+            .ok()
+            .map(|(pid, pp, cpn, is_starred, is_archived)| ProjectRepositoryRow {
+                project_id: pid,
+                project_path: pp,
+                custom_project_name: cpn,
+                is_starred: is_starred as i32,
+                is_archived: is_archived as i32,
+            })
+    }
+
     pub fn get_project_path(project_path: &str) -> Option<ProjectRepositoryRow> {
-        connection::with_connection(|db| {
+        connection::with_db(|conn| {
             let normalized = crate::shared::utils::normalize_project_path(project_path);
-            db.query_row(
-                "SELECT project_id, project_path, custom_project_name, isStarred, isArchived
-                 FROM projects WHERE project_path = ?1",
-                params![normalized],
-                |row| {
-                    Ok(ProjectRepositoryRow {
-                        project_id: row.get(0)?,
-                        project_path: row.get(1)?,
-                        custom_project_name: row.get(2)?,
-                        is_starred: row.get(3)?,
-                        is_archived: row.get(4)?,
-                    })
-                },
-            )
-            .ok()
+            Self::get_project_path_internal(conn, &normalized)
         })
     }
 
-    /// Get project by ID
     pub fn get_project_by_id(project_id: &str) -> Option<ProjectRepositoryRow> {
-        connection::with_connection(|db| {
-            db.query_row(
-                "SELECT project_id, project_path, custom_project_name, isStarred, isArchived
-                 FROM projects WHERE project_id = ?1",
-                params![project_id],
-                |row| {
-                    Ok(ProjectRepositoryRow {
-                        project_id: row.get(0)?,
-                        project_path: row.get(1)?,
-                        custom_project_name: row.get(2)?,
-                        is_starred: row.get(3)?,
-                        is_archived: row.get(4)?,
-                    })
-                },
-            )
-            .ok()
+        connection::with_db(|conn| {
+            use projects::dsl;
+            dsl::projects
+                .filter(dsl::project_id.eq(project_id))
+                .select((
+                    dsl::project_id,
+                    dsl::project_path,
+                    dsl::custom_project_name,
+                    dsl::isStarred,
+                    dsl::isArchived,
+                ))
+                .first::<(String, String, Option<String>, bool, bool)>(conn)
+                .ok()
+                .map(|(pid, pp, cpn, is_starred, is_archived)| ProjectRepositoryRow {
+                    project_id: pid,
+                    project_path: pp,
+                    custom_project_name: cpn,
+                    is_starred: is_starred as i32,
+                    is_archived: is_archived as i32,
+                })
         })
     }
 
-    /// Resolve absolute project path from database project_id
     pub fn get_project_path_by_id(project_id: &str) -> Option<String> {
-        connection::with_connection(|db| {
-            db.query_row(
-                "SELECT project_path FROM projects WHERE project_id = ?1",
-                params![project_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
+        connection::with_db(|conn| {
+            use projects::dsl;
+            dsl::projects
+                .filter(dsl::project_id.eq(project_id))
+                .select(dsl::project_path)
+                .first::<String>(conn)
+                .ok()
         })
     }
 
-    /// List all active (non-archived) projects
     pub fn list_projects() -> Vec<ProjectRepositoryRow> {
-        connection::with_connection(|db| {
-            let mut stmt = db
-                .prepare(
-                    "SELECT project_id, project_path, custom_project_name, isStarred, isArchived
-                     FROM projects WHERE isArchived = 0 ORDER BY isStarred DESC, custom_project_name",
-                )
-                .expect("Failed to prepare query");
-            stmt.query_map([], |row| {
-                Ok(ProjectRepositoryRow {
-                    project_id: row.get(0)?,
-                    project_path: row.get(1)?,
-                    custom_project_name: row.get(2)?,
-                    is_starred: row.get(3)?,
-                    is_archived: row.get(4)?,
+        connection::with_db(|conn| {
+            use projects::dsl;
+            dsl::projects
+                .filter(dsl::isArchived.eq(false))
+                .order((dsl::isStarred.desc(), dsl::custom_project_name.asc()))
+                .select((
+                    dsl::project_id,
+                    dsl::project_path,
+                    dsl::custom_project_name,
+                    dsl::isStarred,
+                    dsl::isArchived,
+                ))
+                .load::<(String, String, Option<String>, bool, bool)>(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(pid, pp, cpn, is_starred, is_archived)| ProjectRepositoryRow {
+                    project_id: pid,
+                    project_path: pp,
+                    custom_project_name: cpn,
+                    is_starred: is_starred as i32,
+                    is_archived: is_archived as i32,
                 })
-            })
-            .expect("Failed to query projects")
-            .filter_map(|r| r.ok())
-            .collect()
+                .collect()
         })
     }
 
-    /// List archived projects
     pub fn list_archived_projects() -> Vec<ProjectRepositoryRow> {
-        connection::with_connection(|db| {
-            let mut stmt = db
-                .prepare(
-                    "SELECT project_id, project_path, custom_project_name, isStarred, isArchived
-                     FROM projects WHERE isArchived = 1 ORDER BY custom_project_name",
-                )
-                .expect("Failed to prepare query");
-            stmt.query_map([], |row| {
-                Ok(ProjectRepositoryRow {
-                    project_id: row.get(0)?,
-                    project_path: row.get(1)?,
-                    custom_project_name: row.get(2)?,
-                    is_starred: row.get(3)?,
-                    is_archived: row.get(4)?,
+        connection::with_db(|conn| {
+            use projects::dsl;
+            dsl::projects
+                .filter(dsl::isArchived.eq(true))
+                .order(dsl::custom_project_name.asc())
+                .select((
+                    dsl::project_id,
+                    dsl::project_path,
+                    dsl::custom_project_name,
+                    dsl::isStarred,
+                    dsl::isArchived,
+                ))
+                .load::<(String, String, Option<String>, bool, bool)>(conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(pid, pp, cpn, is_starred, is_archived)| ProjectRepositoryRow {
+                    project_id: pid,
+                    project_path: pp,
+                    custom_project_name: cpn,
+                    is_starred: is_starred as i32,
+                    is_archived: is_archived as i32,
                 })
-            })
-            .expect("Failed to query archived projects")
-            .filter_map(|r| r.ok())
-            .collect()
+                .collect()
         })
     }
 
-    /// Update custom project name by ID
     pub fn update_custom_name_by_id(project_id: &str, name: &str) -> bool {
-        connection::with_connection(|db| {
-            db.execute(
-                "UPDATE projects SET custom_project_name = ?1 WHERE project_id = ?2",
-                params![name, project_id],
-            )
-            .map(|n| n > 0)
-            .unwrap_or(false)
+        connection::with_db(|conn| {
+            use projects::dsl;
+            diesel::update(dsl::projects.filter(dsl::project_id.eq(project_id)))
+                .set(dsl::custom_project_name.eq(Some(name.to_string())))
+                .execute(conn)
+                .map(|n| n > 0)
+                .unwrap_or(false)
         })
     }
 
-    /// Toggle star on a project
     pub fn update_star_by_id(project_id: &str, starred: bool) {
-        connection::with_connection(|db| {
-            db.execute(
-                "UPDATE projects SET isStarred = ?1 WHERE project_id = ?2",
-                params![starred as i32, project_id],
-            )
-            .ok();
-        });
-    }
-
-    /// Archive/unarchive a project
-    pub fn update_archive_by_id(project_id: &str, archived: bool) {
-        connection::with_connection(|db| {
-            db.execute(
-                "UPDATE projects SET isArchived = ?1 WHERE project_id = ?2",
-                params![archived as i32, project_id],
-            )
-            .ok();
-        });
-    }
-
-    /// Delete a project by ID
-    pub fn delete_by_id(project_id: &str) {
-        connection::with_connection(|db| {
-            db.execute("DELETE FROM projects WHERE project_id = ?1", params![project_id])
+        connection::with_db(|conn| {
+            use projects::dsl;
+            diesel::update(dsl::projects.filter(dsl::project_id.eq(project_id)))
+                .set(dsl::isStarred.eq(starred))
+                .execute(conn)
                 .ok();
         });
     }
 
-    /// Migrate legacy starred project IDs from localStorage
+    pub fn update_archive_by_id(project_id: &str, archived: bool) {
+        connection::with_db(|conn| {
+            use projects::dsl;
+            diesel::update(dsl::projects.filter(dsl::project_id.eq(project_id)))
+                .set(dsl::isArchived.eq(archived))
+                .execute(conn)
+                .ok();
+        });
+    }
+
+    pub fn delete_by_id(project_id: &str) {
+        connection::with_db(|conn| {
+            use projects::dsl;
+            diesel::delete(dsl::projects.filter(dsl::project_id.eq(project_id)))
+                .execute(conn)
+                .ok();
+        });
+    }
+
     pub fn migrate_legacy_stars(project_ids: &[String]) -> usize {
-        connection::with_connection(|db| {
+        connection::with_db(|conn| {
+            use projects::dsl;
             let mut updated = 0usize;
             for pid in project_ids {
-                if let Ok(n) = db.execute(
-                    "UPDATE projects SET isStarred = 1 WHERE project_id = ?1",
-                    params![pid],
-                ) {
+                if let Ok(n) = diesel::update(dsl::projects.filter(dsl::project_id.eq(pid)))
+                    .set(dsl::isStarred.eq(true))
+                    .execute(conn)
+                {
                     updated += n;
                 }
             }

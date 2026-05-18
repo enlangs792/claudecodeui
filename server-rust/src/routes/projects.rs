@@ -96,8 +96,9 @@ async fn list_projects() -> Json<Value> {
                     "id": row.session_id,
                     "summary": row.custom_name.clone().unwrap_or_default(),
                     "messageCount": 0,
-                    "lastActivity": row.updated_at.clone()
-                        .or_else(|| row.created_at.clone())
+                    "lastActivity": row.updated_at
+                        .or(row.created_at)
+                        .map(|t| t.and_utc().to_rfc3339())
                         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                 });
                 match row.provider.as_str() {
@@ -758,31 +759,29 @@ async fn list_archived_projects() -> Json<Value> {
 
             // Fetch ALL sessions (including archived) for archived project view
             let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>)> =
-                crate::db::connection::with_connection(|db| {
+                crate::db::connection::with_db(|conn| {
+                    use diesel::prelude::*;
+                    use crate::db::schema::sessions;
                     let normalized = crate::shared::utils::normalize_project_path(&p.project_path);
-                    let mut stmt = db
-                        .prepare(
-                            "SELECT session_id, provider, custom_name, created_at, updated_at
-                             FROM sessions WHERE project_path = ?1
-                             ORDER BY updated_at DESC",
-                        )
-                        .ok()?;
-                    let results = stmt
-                        .query_map(rusqlite::params![&normalized], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Option<String>>(2)?,
-                                row.get::<_, Option<String>>(3)?,
-                                row.get::<_, Option<String>>(4)?,
-                            ))
+                    sessions::table
+                        .filter(sessions::project_path.eq(&normalized))
+                        .order(sessions::updated_at.desc())
+                        .select((
+                            sessions::session_id,
+                            sessions::provider,
+                            sessions::custom_name,
+                            sessions::created_at,
+                            sessions::updated_at,
+                        ))
+                        .load::<(String, String, Option<String>, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>(conn)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(sid, prov, cn, ca, ua)| {
+                            (sid, prov, cn, ca.map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()), ua.map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()))
                         })
-                        .ok()?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    Some(results)
-                })
-                .unwrap_or_default();
+                        .collect::<Vec<_>>()
+                        .into()
+                });
 
             let total = rows.len();
             let mut sessions = Vec::new();
@@ -860,8 +859,9 @@ async fn get_project_sessions(
             "id": row.session_id,
             "summary": row.custom_name.clone().unwrap_or_default(),
             "messageCount": 0,
-            "lastActivity": row.updated_at.clone()
-                .or_else(|| row.created_at.clone())
+            "lastActivity": row.updated_at
+                .or(row.created_at)
+                .map(|t| t.and_utc().to_rfc3339())
                 .unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
         });
         match row.provider.as_str() {
@@ -1313,11 +1313,13 @@ async fn delete_project(
 
         // Delete all session rows for this project path
         let normalized = utils::normalize_project_path(&project.project_path);
-        crate::db::connection::with_connection(|db| {
-            db.execute(
-                "DELETE FROM sessions WHERE project_path = ?1",
-                rusqlite::params![&normalized],
+        crate::db::connection::with_db(|conn| {
+            use diesel::prelude::*;
+            use crate::db::schema::sessions;
+            diesel::delete(
+                sessions::table.filter(sessions::project_path.eq(&normalized)),
             )
+            .execute(conn)
             .ok();
         });
 

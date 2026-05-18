@@ -295,14 +295,11 @@ fn start_server() -> anyhow::Result<()> {
     // Initialize database, start server — same as main.rs
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        use cloudcli_server::db::connection::get_connection;
+        use cloudcli_server::db::connection::init_pool;
         use cloudcli_server::db::migrations::initialize_database;
 
-        {
-            let guard = get_connection();
-            let conn = guard.as_ref().expect("Database not initialized");
-            initialize_database(conn);
-        }
+        init_pool();
+        initialize_database();
 
         let app_root = find_app_root();
         tracing::info!("App root resolved to: {}", app_root.display());

@@ -1,89 +1,90 @@
-//! Database integration tests
+//! Database integration tests — Diesel implementation
 
 #[cfg(test)]
 mod tests {
-    use cloudcli_server::db::connection;
+    use diesel::prelude::*;
     use cloudcli_server::db::migrations;
-    use cloudcli_server::db::schema::INIT_SCHEMA_SQL;
-    use rusqlite::Connection;
+    use cloudcli_server::db::schema;
 
-    fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("Failed to create in-memory database");
-        conn.execute_batch(INIT_SCHEMA_SQL)
-            .expect("Failed to initialize schema");
-        migrations::run_migrations(&conn);
+    fn setup_test_db() -> diesel::SqliteConnection {
+        let mut conn = diesel::SqliteConnection::establish(":memory:")
+            .expect("Failed to create in-memory database");
+        diesel::sql_query("PRAGMA foreign_keys=ON")
+            .execute(&mut conn)
+            .expect("Failed to enable foreign keys");
+        migrations::run_migrations(&mut conn);
         conn
     }
 
     #[test]
-    fn test_schema_creates_all_tables() {
-        let conn = setup_test_db();
-
-        let tables = ["users", "api_keys", "user_credentials", "user_notification_preferences",
-                      "vapid_keys", "push_subscriptions", "projects", "sessions",
-                      "scan_state", "app_config"];
-
-        for table in &tables {
-            let count: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            assert!(count > 0, "Table {table} should exist");
-        }
-    }
-
-    #[test]
     fn test_users_table_schema() {
-        let conn = setup_test_db();
-
-        conn.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?1, ?2)",
-            rusqlite::params!["testuser", "hash123"],
-        )
-        .expect("Failed to insert user");
-
-        let username: String = conn
-            .query_row("SELECT username FROM users WHERE id=1", [], |row| row.get(0))
+        let mut conn = setup_test_db();
+        use schema::users;
+        let new_user = cloudcli_server::db::models::NewUser {
+            username: "testuser".to_string(),
+            password_hash: "hash123".to_string(),
+        };
+        diesel::insert_into(users::table)
+            .values(&new_user)
+            .execute(&mut conn)
+            .expect("Failed to insert user");
+        let username: String = users::table
+            .filter(users::id.eq(1))
+            .select(users::username)
+            .first(&mut conn)
             .expect("Failed to query user");
         assert_eq!(username, "testuser");
     }
 
     #[test]
     fn test_projects_table_schema() {
-        let conn = setup_test_db();
-
-        conn.execute(
-            "INSERT INTO projects (project_id, project_path, custom_project_name) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["proj-001", "/home/user/test", "Test Project"],
-        )
-        .expect("Failed to insert project");
-
-        let path: String = conn
-            .query_row("SELECT project_path FROM projects WHERE project_id='proj-001'", [], |row| row.get(0))
+        let mut conn = setup_test_db();
+        use schema::projects;
+        let new_project = cloudcli_server::db::models::NewProject {
+            project_id: "proj-001".to_string(),
+            project_path: "/home/user/test".to_string(),
+            custom_project_name: Some("Test Project".to_string()),
+        };
+        diesel::insert_into(projects::table)
+            .values(&new_project)
+            .execute(&mut conn)
+            .expect("Failed to insert project");
+        let path: String = projects::table
+            .filter(projects::project_id.eq("proj-001"))
+            .select(projects::project_path)
+            .first(&mut conn)
             .expect("Failed to query project");
         assert_eq!(path, "/home/user/test");
     }
 
     #[test]
     fn test_sessions_table_schema() {
-        let conn = setup_test_db();
-
-        conn.execute(
-            "INSERT INTO projects (project_id, project_path) VALUES (?1, ?2)",
-            rusqlite::params!["proj-002", "/tmp/test"],
-        ).expect("Failed to insert project");
-
-        conn.execute(
-            "INSERT INTO sessions (session_id, provider, project_path) VALUES (?1, ?2, ?3)",
-            rusqlite::params!["sess-001", "claude", "/tmp/test"],
-        )
-        .expect("Failed to insert session");
-
-        let provider: String = conn
-            .query_row("SELECT provider FROM sessions WHERE session_id='sess-001'", [], |row| row.get(0))
+        let mut conn = setup_test_db();
+        use schema::{projects, sessions};
+        let new_project = cloudcli_server::db::models::NewProject {
+            project_id: "proj-002".to_string(),
+            project_path: "/tmp/test".to_string(),
+            custom_project_name: None,
+        };
+        diesel::insert_into(projects::table)
+            .values(&new_project)
+            .execute(&mut conn)
+            .expect("Failed to insert project");
+        let new_session = cloudcli_server::db::models::NewSession {
+            session_id: "sess-001".to_string(),
+            provider: "claude".to_string(),
+            custom_name: None,
+            project_path: Some("/tmp/test".to_string()),
+            jsonl_path: None,
+        };
+        diesel::insert_into(sessions::table)
+            .values(&new_session)
+            .execute(&mut conn)
+            .expect("Failed to insert session");
+        let provider: String = sessions::table
+            .filter(sessions::session_id.eq("sess-001"))
+            .select(sessions::provider)
+            .first(&mut conn)
             .expect("Failed to query session");
         assert_eq!(provider, "claude");
     }

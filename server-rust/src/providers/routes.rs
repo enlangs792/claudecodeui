@@ -202,7 +202,7 @@ async fn list_provider_sessions(
                 "provider": s.provider,
                 "projectPath": s.project_path,
                 "customName": s.custom_name,
-                "isArchived": s.is_archived == 1,
+                "isArchived": s.is_archived,
                 "createdAt": s.created_at,
                 "updatedAt": s.updated_at,
             })
@@ -647,7 +647,7 @@ async fn search_sessions(
                     "provider": session.provider,
                     "customName": session.custom_name,
                     "projectPath": session.project_path,
-                    "isArchived": session.is_archived == 1,
+                    "isArchived": session.is_archived,
                     "createdAt": session.created_at,
                     "updatedAt": session.updated_at,
                 });

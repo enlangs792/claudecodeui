@@ -1,49 +1,56 @@
-//! App Config repository — mirrors server/modules/database/repositories/app-config.ts
+//! App Config repository — Diesel implementation
 
-use rusqlite::params;
+use diesel::prelude::*;
 use crate::db::connection;
+use crate::db::models;
+use crate::db::schema::app_config;
 
 pub struct AppConfigRepo;
 
 impl AppConfigRepo {
-    /// Get a config value by key
     pub fn get(key: &str) -> Option<String> {
-        connection::with_connection(|db| {
-            db.query_row(
-                "SELECT value FROM app_config WHERE key = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .ok()
+        connection::with_db(|conn| {
+            use app_config::dsl;
+            dsl::app_config
+                .filter(dsl::key.eq(key))
+                .select(dsl::value)
+                .first::<String>(conn)
+                .ok()
         })
     }
 
-    /// Set a config key-value pair
     pub fn set(key: &str, value: &str) {
-        connection::with_connection(|db| {
-            db.execute(
-                "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                params![key, value],
-            )
-            .ok();
-        });
-    }
+        connection::with_db(|conn| {
+            use app_config::dsl;
 
-    /// Delete a config key
-    pub fn delete(key: &str) {
-        connection::with_connection(|db| {
-            db.execute("DELETE FROM app_config WHERE key = ?1", params![key])
+            let new_config = models::NewAppConfig {
+                key: key.to_string(),
+                value: value.to_string(),
+            };
+
+            diesel::insert_into(app_config::table)
+                .values(&new_config)
+                .on_conflict(dsl::key)
+                .do_update()
+                .set(dsl::value.eq(value.to_string()))
+                .execute(conn)
                 .ok();
         });
     }
 
-    /// Get the JWT secret (stored in app_config during first run)
+    pub fn delete(key: &str) {
+        connection::with_db(|conn| {
+            use app_config::dsl;
+            diesel::delete(dsl::app_config.filter(dsl::key.eq(key)))
+                .execute(conn)
+                .ok();
+        });
+    }
+
     pub fn get_jwt_secret() -> Option<String> {
         Self::get("jwt_secret")
     }
 
-    /// Persist a generated JWT secret
     pub fn set_jwt_secret(secret: &str) {
         Self::set("jwt_secret", secret);
     }

@@ -1,31 +1,21 @@
 //! Auth middleware integration tests
 
 use cloudcli_server::auth::middleware;
-use cloudcli_server::db::connection;
-use cloudcli_server::db::migrations;
-use cloudcli_server::db::schema::INIT_SCHEMA_SQL;
-use cloudcli_server::db::repos::users::UserRepo;
-use cloudcli_server::db::repos::app_config::AppConfigRepo;
-use rusqlite::Connection;
+use std::sync::Once;
 
-fn setup_test_db() -> Connection {
-    let conn = Connection::open_in_memory().expect("Failed to create in-memory database");
-    conn.execute_batch(INIT_SCHEMA_SQL).expect("Schema init");
-    migrations::run_migrations(&conn);
-    conn
-}
+static INIT: Once = Once::new();
 
-fn setup_with_user() {
-    let _conn = setup_test_db();
-    // Insert the test connection into the global singleton
-    // Note: The singleton pattern makes this tricky.
-    // For now, we test the token functions which don't need the DB connection.
+fn ensure_test_env() {
+    INIT.call_once(|| {
+        std::env::set_var("JWT_SECRET", "test-jwt-secret-for-auth-tests");
+    });
 }
 
 // ── Token generation and verification ───────────────────────────────────────
 
 #[test]
 fn test_generate_and_verify_token() {
+    ensure_test_env();
     let token = middleware::generate_token(1, "testuser");
     assert!(!token.is_empty());
 
@@ -38,6 +28,7 @@ fn test_generate_and_verify_token() {
 
 #[test]
 fn test_token_expiry_is_7_days() {
+    ensure_test_env();
     let token = middleware::generate_token(1, "testuser");
     let claims = middleware::verify_token_for_test(&token).unwrap();
     let duration = claims.exp - claims.iat;
@@ -47,6 +38,7 @@ fn test_token_expiry_is_7_days() {
 
 #[test]
 fn test_tampered_token_fails() {
+    ensure_test_env();
     let mut token = middleware::generate_token(1, "testuser");
     // Tamper with the token by changing a character in the payload
     token.push('x');
@@ -56,6 +48,7 @@ fn test_tampered_token_fails() {
 
 #[test]
 fn test_expired_token_fails() {
+    ensure_test_env();
     // Create a token that expired 1 day ago
     use jsonwebtoken::{encode, EncodingKey, Header};
     let now = std::time::SystemTime::now()
@@ -87,6 +80,7 @@ fn test_expired_token_fails() {
 
 #[test]
 fn test_authenticate_websocket_without_token() {
+    ensure_test_env();
     let result = middleware::authenticate_websocket(None);
     // In non-platform mode without a token, should return None
     assert!(result.is_none(), "No token should return None");
@@ -94,6 +88,7 @@ fn test_authenticate_websocket_without_token() {
 
 #[test]
 fn test_authenticate_websocket_with_invalid_token() {
+    ensure_test_env();
     let result = middleware::authenticate_websocket(Some("invalid-token-here"));
     assert!(result.is_none(), "Invalid token should return None");
 }

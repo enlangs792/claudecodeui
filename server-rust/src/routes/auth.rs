@@ -111,7 +111,7 @@ async fn login(Json(body): Json<LoginRequest>) -> Result<Json<Value>, (StatusCod
         "success": true,
         "token": token,
         "user": { "id": user.id, "username": user.username },
-        "hasCompletedOnboarding": user.has_completed_onboarding == 1
+        "hasCompletedOnboarding": user.has_completed_onboarding
     })))
 }
 
