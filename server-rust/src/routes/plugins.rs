@@ -350,11 +350,11 @@ pub fn routes() -> Router {
     Router::new()
         .route("/", get(list_plugins))
         .route("/{name}/manifest", get(get_manifest))
-        .route("/{name}/assets/*asset_path", get(serve_asset))
+        .route("/{name}/assets/{*asset_path}", get(serve_asset))
         .route("/{name}/enable", put(toggle_enable))
         .route("/install", post(install_plugin))
         .route("/{name}/update", post(update_plugin))
-        .route("/{name}/rpc/*rpc_path", any(handle_rpc))
+        .route("/{name}/rpc/{*rpc_path}", any(handle_rpc))
         .route("/{name}", delete(uninstall_plugin))
 }
 

@@ -38,11 +38,11 @@ pub fn routes() -> Router {
     Router::new()
         .route("/", get(get_settings).put(update_settings))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
-        .route("/api-keys/:key_id", delete(delete_api_key))
-        .route("/api-keys/:key_id/toggle", patch(toggle_api_key))
+        .route("/api-keys/{key_id}", delete(delete_api_key))
+        .route("/api-keys/{key_id}/toggle", patch(toggle_api_key))
         .route("/credentials", get(list_credentials).post(create_credential))
-        .route("/credentials/:credential_id", delete(delete_credential))
-        .route("/credentials/:credential_id/toggle", patch(toggle_credential))
+        .route("/credentials/{credential_id}", delete(delete_credential))
+        .route("/credentials/{credential_id}/toggle", patch(toggle_credential))
         .route(
             "/notification-preferences",
             get(get_notification_prefs).put(update_notification_prefs),
