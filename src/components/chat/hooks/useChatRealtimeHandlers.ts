@@ -4,52 +4,22 @@ import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
 import { usePaletteOps } from '../../../contexts/PaletteOpsContext';
 import type { PendingPermissionRequest, SessionNavigationOptions } from '../types/types';
 import type { ProjectSession, LLMProvider } from '../../../types/app';
-import type { SessionStore, NormalizedMessage } from '../../../stores/useSessionStore';
+import type { SessionStore } from '../../../stores/useSessionStore';
+import {
+  drainAndProcessRealtimeFrames,
+  type RealtimeChatMessage,
+} from './chatRealtimeProcessor';
 
 type PendingViewSession = {
   sessionId: string | null;
   startedAt: number;
 };
 
-type LatestChatMessage = {
-  type?: string;
-  kind?: string;
-  data?: any;
-  message?: any;
-  delta?: string;
-  sessionId?: string;
-  session_id?: string;
-  requestId?: string;
-  toolName?: string;
-  input?: unknown;
-  context?: unknown;
-  error?: string;
-  tool?: any;
-  toolId?: string;
-  result?: any;
-  exitCode?: number;
-  isProcessing?: boolean;
-  actualSessionId?: string;
-  event?: string;
-  status?: any;
-  isNewSession?: boolean;
-  resultText?: string;
-  isError?: boolean;
-  success?: boolean;
-  reason?: string;
-  provider?: string;
-  content?: string;
-  text?: string;
-  tokens?: number;
-  canInterrupt?: boolean;
-  tokenBudget?: unknown;
-  newSessionId?: string;
-  aborted?: boolean;
-  [key: string]: any;
-};
-
 interface UseChatRealtimeHandlersArgs {
-  latestMessage: LatestChatMessage | null;
+  /** Increments once per inbound WS frame so rapid stream_delta frames are not dropped. */
+  messageSeq: number;
+  latestMessage: RealtimeChatMessage | null;
+  drainMessagesSince: (lastSeq: number) => Array<{ seq: number; message: RealtimeChatMessage }>;
   provider: LLMProvider;
   selectedSession: ProjectSession | null;
   currentSessionId: string | null;
@@ -62,6 +32,8 @@ interface UseChatRealtimeHandlersArgs {
   pendingViewSessionRef: MutableRefObject<PendingViewSession | null>;
   streamTimerRef: MutableRefObject<number | null>;
   accumulatedStreamRef: MutableRefObject<string>;
+  thinkingTimerRef: MutableRefObject<number | null>;
+  accumulatedThinkingRef: MutableRefObject<string>;
   onSessionInactive?: (sessionId?: string | null) => void;
   onSessionProcessing?: (sessionId?: string | null) => void;
   onSessionNotProcessing?: (sessionId?: string | null) => void;
@@ -70,12 +42,10 @@ interface UseChatRealtimeHandlersArgs {
   sessionStore: SessionStore;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Hook                                                              */
-/* ------------------------------------------------------------------ */
-
 export function useChatRealtimeHandlers({
+  messageSeq,
   latestMessage,
+  drainMessagesSince,
   provider,
   selectedSession,
   currentSessionId,
@@ -88,6 +58,8 @@ export function useChatRealtimeHandlers({
   pendingViewSessionRef,
   streamTimerRef,
   accumulatedStreamRef,
+  thinkingTimerRef,
+  accumulatedThinkingRef,
   onSessionInactive,
   onSessionProcessing,
   onSessionNotProcessing,
@@ -96,296 +68,53 @@ export function useChatRealtimeHandlers({
   sessionStore,
 }: UseChatRealtimeHandlersArgs) {
   const paletteOps = usePaletteOps();
-  const lastProcessedMessageRef = useRef<LatestChatMessage | null>(null);
+  const lastProcessedSeqRef = useRef(0);
 
   useEffect(() => {
-    if (!latestMessage) return;
-    if (lastProcessedMessageRef.current === latestMessage) return;
-    lastProcessedMessageRef.current = latestMessage;
+    if (messageSeq === 0) return;
+    if (messageSeq <= lastProcessedSeqRef.current && !latestMessage) return;
+
+    const frames = drainMessagesSince(lastProcessedSeqRef.current);
+    if (frames.length === 0 && latestMessage) {
+      frames.push({ seq: messageSeq, message: latestMessage });
+    }
+    if (frames.length === 0) return;
 
     const activeViewSessionId =
       selectedSession?.id || currentSessionId || pendingViewSessionRef.current?.sessionId || null;
 
-    /* ---------------------------------------------------------------- */
-    /*  Legacy messages (no `kind` field) — handle and return           */
-    /* ---------------------------------------------------------------- */
-
-    const msg = latestMessage as any;
-
-    if (!msg.kind) {
-      const messageType = String(msg.type || '');
-
-      switch (messageType) {
-        case 'websocket-reconnected':
-          onWebSocketReconnect?.();
-          return;
-
-        case 'pending-permissions-response': {
-          const permSessionId = msg.sessionId;
-          const isCurrentPermSession =
-            permSessionId === currentSessionId || (selectedSession && permSessionId === selectedSession.id);
-          if (permSessionId && !isCurrentPermSession) return;
-          setPendingPermissionRequests(msg.data || []);
-          return;
-        }
-
-        case 'session-status': {
-          const statusSessionId = msg.sessionId;
-          if (!statusSessionId) return;
-
-          const status = msg.status;
-          if (status) {
-            const statusInfo = {
-              text: status.text || 'Working...',
-              tokens: status.tokens || 0,
-              can_interrupt: status.can_interrupt !== undefined ? status.can_interrupt : true,
-            };
-            setClaudeStatus(statusInfo);
-            setIsLoading(true);
-            setCanAbortSession(statusInfo.can_interrupt);
-            return;
-          }
-
-          // Legacy isProcessing format from check-session-status
-          const isCurrentSession =
-            statusSessionId === currentSessionId || (selectedSession && statusSessionId === selectedSession.id);
-
-          if (msg.isProcessing) {
-            onSessionProcessing?.(statusSessionId);
-            if (isCurrentSession) { setIsLoading(true); setCanAbortSession(true); }
-            return;
-          }
-          onSessionInactive?.(statusSessionId);
-          onSessionNotProcessing?.(statusSessionId);
-          if (isCurrentSession) {
-            setIsLoading(false);
-            setCanAbortSession(false);
-            setClaudeStatus(null);
-          }
-          return;
-        }
-
-        default:
-          // Unknown legacy message type — ignore
-          return;
-      }
-    }
-
-    /* ---------------------------------------------------------------- */
-    /*  NormalizedMessage handling (has `kind` field)                    */
-    /* ---------------------------------------------------------------- */
-
-    const sid = msg.sessionId || activeViewSessionId;
-
-    // --- Streaming: buffer for performance ---
-    if (msg.kind === 'stream_delta') {
-      const text = msg.content || '';
-      if (!text) return;
-      accumulatedStreamRef.current += text;
-      if (!streamTimerRef.current) {
-        streamTimerRef.current = window.setTimeout(() => {
-          streamTimerRef.current = null;
-          if (sid) {
-            sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-          }
-        }, 100);
-      }
-      // Also route to store for non-active sessions
-      if (sid && sid !== activeViewSessionId) {
-        sessionStore.appendRealtime(sid, msg as NormalizedMessage);
-      }
-      return;
-    }
-
-    if (msg.kind === 'stream_end') {
-      if (streamTimerRef.current) {
-        clearTimeout(streamTimerRef.current);
-        streamTimerRef.current = null;
-      }
-      if (sid) {
-        if (accumulatedStreamRef.current) {
-          sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-        }
-        sessionStore.finalizeStreaming(sid);
-      }
-      accumulatedStreamRef.current = '';
-      return;
-    }
-
-    // --- All other messages: route to store ---
-    const shouldPersist =
-      msg.kind !== 'session_created'
-      && msg.kind !== 'complete'
-      && msg.kind !== 'status'
-      && msg.kind !== 'permission_request'
-      && msg.kind !== 'permission_cancelled';
-
-    if (sid && shouldPersist) {
-      sessionStore.appendRealtime(sid, msg as NormalizedMessage);
-    }
-
-    // --- UI side effects for specific kinds ---
-    switch (msg.kind) {
-      case 'session_created': {
-        const newSessionId = msg.newSessionId;
-        if (!newSessionId) break;
-
-        // We no longer synthesize client-side placeholder IDs. Until the provider
-        // announces `session_created`, the active id is expected to be null.
-        if (!currentSessionId) {
-          console.log('Session created with ID:', newSessionId);
-          console.log('Existing session ID:', currentSessionId);
-          sessionStorage.setItem('pendingSessionId', newSessionId);
-          if (pendingViewSessionRef.current && !pendingViewSessionRef.current.sessionId) {
-            pendingViewSessionRef.current.sessionId = newSessionId;
-          }
-          setCurrentSessionId(newSessionId);
-          setPendingPermissionRequests((prev) =>
-            prev.map((r) => (r.sessionId ? r : { ...r, sessionId: newSessionId })),
-          );
-        }
-        onNavigateToSession?.(newSessionId);
-        break;
-      }
-
-      case 'complete': {
-        // Flush any remaining streaming state
-        if (streamTimerRef.current) {
-          clearTimeout(streamTimerRef.current);
-          streamTimerRef.current = null;
-        }
-        if (sid && accumulatedStreamRef.current) {
-          sessionStore.updateStreaming(sid, accumulatedStreamRef.current, provider);
-          sessionStore.finalizeStreaming(sid);
-        }
-        accumulatedStreamRef.current = '';
-
-        setIsLoading(false);
-        setCanAbortSession(false);
-        setClaudeStatus(null);
-        setPendingPermissionRequests([]);
-        onSessionInactive?.(sid);
-        onSessionNotProcessing?.(sid);
-
-        // Handle aborted case
-        if (msg.aborted) {
-          // Abort was requested — the complete event confirms it
-          // No special UI action needed beyond clearing loading state above
-          // The backend already sent any abort-related messages
-          break;
-        }
-
-        const actualSessionId =
-          typeof msg.actualSessionId === 'string' && msg.actualSessionId.trim().length > 0
-            ? msg.actualSessionId
-            : null;
-        const pendingSessionId = sessionStorage.getItem('pendingSessionId');
-        const completedSuccessfully = msg.exitCode === undefined || msg.exitCode === 0;
-        const isVisibleSession =
-          Boolean(
-            sid
-            && (
-              sid === activeViewSessionId
-              || sid === pendingSessionId
-              || pendingViewSessionRef.current?.sessionId === sid
-            ),
-          );
-
-        if (actualSessionId && sid && actualSessionId !== sid) {
-          sessionStore.replaceSessionId(sid, actualSessionId);
-
-          if (isVisibleSession) {
-            setCurrentSessionId(actualSessionId);
-
-            if (pendingViewSessionRef.current) {
-              const pendingSession = pendingViewSessionRef.current.sessionId;
-              if (!pendingSession || pendingSession === sid) {
-                pendingViewSessionRef.current.sessionId = actualSessionId;
-              }
-            }
-          }
-
-          if (completedSuccessfully && pendingSessionId === sid) {
-            sessionStorage.removeItem('pendingSessionId');
-          }
-
-          if (isVisibleSession) {
-            onNavigateToSession?.(actualSessionId, { replace: true });
-            setTimeout(() => { void paletteOps.refreshProjects(); }, 500);
-          }
-          break;
-        }
-
-        // Clear pending session
-        if (pendingSessionId && !currentSessionId && completedSuccessfully) {
-          const resolvedSessionId = actualSessionId || pendingSessionId;
-          setCurrentSessionId(resolvedSessionId);
-          if (actualSessionId) {
-            onNavigateToSession?.(resolvedSessionId, { replace: true });
-          }
-          sessionStorage.removeItem('pendingSessionId');
-          setTimeout(() => { void paletteOps.refreshProjects(); }, 500);
-        }
-        break;
-      }
-
-      case 'error': {
-        setIsLoading(false);
-        setCanAbortSession(false);
-        setClaudeStatus(null);
-        onSessionInactive?.(sid);
-        onSessionNotProcessing?.(sid);
-        break;
-      }
-
-      case 'permission_request': {
-        if (!msg.requestId) break;
-        setPendingPermissionRequests((prev) => {
-          if (prev.some((r: PendingPermissionRequest) => r.requestId === msg.requestId)) return prev;
-          return [...prev, {
-            requestId: msg.requestId,
-            toolName: msg.toolName || 'UnknownTool',
-            input: msg.input,
-            context: msg.context,
-            sessionId: sid || null,
-            receivedAt: new Date(),
-          }];
-        });
-        setIsLoading(true);
-        setCanAbortSession(true);
-        setClaudeStatus({ text: 'Waiting for permission', tokens: 0, can_interrupt: true });
-        break;
-      }
-
-      case 'permission_cancelled': {
-        if (msg.requestId) {
-          setPendingPermissionRequests((prev) => prev.filter((r: PendingPermissionRequest) => r.requestId !== msg.requestId));
-        }
-        break;
-      }
-
-      case 'status': {
-        if (msg.text === 'token_budget' && msg.tokenBudget) {
-          setTokenBudget(msg.tokenBudget as Record<string, unknown>);
-        } else if (msg.text) {
-          setClaudeStatus({
-            text: msg.text,
-            tokens: msg.tokens || 0,
-            can_interrupt: msg.canInterrupt !== undefined ? msg.canInterrupt : true,
-          });
-          setIsLoading(true);
-          setCanAbortSession(msg.canInterrupt !== false);
-        }
-        break;
-      }
-
-      // text, tool_use, tool_result, thinking, interactive_prompt, task_notification
-      // → already routed to store above, no UI side effects needed
-      default:
-        break;
-    }
+    lastProcessedSeqRef.current = drainAndProcessRealtimeFrames(
+      frames,
+      {
+        provider,
+        selectedSession,
+        currentSessionId,
+        activeViewSessionId,
+        setCurrentSessionId,
+        setIsLoading,
+        setCanAbortSession,
+        setClaudeStatus,
+        setTokenBudget,
+        setPendingPermissionRequests,
+        pendingViewSessionRef,
+        streamTimerRef,
+        accumulatedStreamRef,
+        thinkingTimerRef,
+        accumulatedThinkingRef,
+        onSessionInactive,
+        onSessionProcessing,
+        onSessionNotProcessing,
+        onNavigateToSession,
+        onWebSocketReconnect,
+        sessionStore,
+        refreshProjects: () => paletteOps.refreshProjects(),
+      },
+      lastProcessedSeqRef.current,
+    );
   }, [
+    messageSeq,
     latestMessage,
+    drainMessagesSince,
     provider,
     selectedSession,
     currentSessionId,
@@ -398,6 +127,8 @@ export function useChatRealtimeHandlers({
     pendingViewSessionRef,
     streamTimerRef,
     accumulatedStreamRef,
+    thinkingTimerRef,
+    accumulatedThinkingRef,
     onSessionInactive,
     onSessionProcessing,
     onSessionNotProcessing,

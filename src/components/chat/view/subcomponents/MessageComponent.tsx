@@ -381,7 +381,7 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, o
               </div>
             ) : message.isThinking ? (
               /* Thinking messages — Reasoning component (ai-elements pattern) */
-              <Reasoning defaultOpen={false}>
+              <Reasoning defaultOpen={false} isStreaming={Boolean(message.isStreaming)}>
                 <ReasoningTrigger />
                 <ReasoningContent>
                   <Markdown className="prose prose-sm prose-gray max-w-none dark:prose-invert">

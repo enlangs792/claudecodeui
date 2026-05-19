@@ -64,3 +64,5 @@ which = { version = "7", optional = true }
 agent-client-protocol = "0.12"
 tokio-test = "0.4"
 tempfile = "3"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"

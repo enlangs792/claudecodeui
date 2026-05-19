@@ -267,15 +267,23 @@ impl AcpBridge {
         tokio::spawn(async move {
             let mut rx = handle.subscribe_events();
             handle.begin();
+            let mut sent_complete = false;
             while let Ok(msg) = rx.recv().await {
+                sent_complete = msg.contains("\"kind\":\"complete\"");
                 if ws_tx.send(msg).await.is_err() {
                     break;
                 }
+                if sent_complete {
+                    handle.processing.store(false, Ordering::SeqCst);
+                    break;
+                }
             }
-            handle.processing.store(false, Ordering::SeqCst);
-            let _ = ws_tx
-                .send(complete(&handle.ui_session_id, provider))
-                .await;
+            if !sent_complete {
+                handle.processing.store(false, Ordering::SeqCst);
+                let _ = ws_tx
+                    .send(complete(&handle.ui_session_id, provider))
+                    .await;
+            }
         });
     }
 }
@@ -421,11 +429,18 @@ async fn run_session_driver(
 
                     match cmd {
                         SessionCommand::Prompt { blocks } => {
-                            send_prompt_blocks(&mut session, blocks).await?;
-                            // Stream chunks may arrive via `on_receive_notification`; draining
-                            // read_update avoids blocking forever when StopReason is not pumped
-                            // after a raw `send_request_to` prompt (common with ACP agents).
-                            drain_session_updates(&mut session, &event_tx, &ui_sid, prov).await?;
+                            // Session-scoped updates are routed to `session.read_update()` by
+                            // ActiveSessionHandler, not the global `on_receive_notification`
+                            // callback. Pump read_update while the prompt RPC is in flight so
+                            // stream_delta/thinking reach the WS forwarder during the turn.
+                            send_prompt_and_stream_updates(
+                                &mut session,
+                                blocks,
+                                &event_tx,
+                                &ui_sid,
+                                prov,
+                            )
+                            .await?;
                             let _ = event_tx.send(complete(&ui_sid, prov));
                         }
                         SessionCommand::Abort => {
@@ -449,17 +464,72 @@ async fn run_session_driver(
     connect_result.map_err(|e| format!("ACP connection error: {e}"))
 }
 
-async fn send_prompt_blocks(
+async fn send_prompt_and_stream_updates(
     session: &mut agent_client_protocol::ActiveSession<'static, Agent>,
     blocks: Vec<ContentBlock>,
+    event_tx: &broadcast::Sender<String>,
+    ui_session_id: &str,
+    provider: LlmProvider,
 ) -> AcpResult<()> {
     let session_id = session.session_id().clone();
     let conn = session.connection();
-    let _response = conn
+    let prompt = conn
         .send_request_to(Agent, PromptRequest::new(session_id, blocks))
-        .block_task()
-        .await?;
-    Ok(())
+        .block_task();
+    tokio::pin!(prompt);
+
+    loop {
+        tokio::select! {
+            prompt_result = prompt.as_mut() => {
+                let _ = prompt_result?;
+                break;
+            }
+            update_result = session.read_update() => {
+                let stop = forward_session_update(
+                    update_result?,
+                    event_tx,
+                    ui_session_id,
+                    provider,
+                )
+                .await?;
+                if stop {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Stragglers after prompt RPC returns (StopReason may not be pumped with raw send_request_to).
+    drain_session_updates(session, event_tx, ui_session_id, provider).await
+}
+
+async fn forward_session_update(
+    update: SessionMessage,
+    event_tx: &broadcast::Sender<String>,
+    ui_session_id: &str,
+    provider: LlmProvider,
+) -> AcpResult<bool> {
+    match update {
+        SessionMessage::SessionMessage(dispatch) => {
+            MatchDispatch::new(dispatch)
+                .if_notification(async move |notif: SessionNotification| {
+                    if let Some(json) = ws_outbound::map_session_notification(
+                        &notif,
+                        ui_session_id,
+                        provider,
+                    ) {
+                        let _ = event_tx.send(json);
+                    }
+                    Ok(())
+                })
+                .await
+                .otherwise_ignore()?;
+            Ok(false)
+        }
+        SessionMessage::StopReason(_) => Ok(true),
+        #[allow(unreachable_patterns)]
+        _ => Ok(false),
+    }
 }
 
 async fn drain_session_updates(
@@ -478,26 +548,10 @@ async fn drain_session_updates(
             Ok(Ok(update)) => update,
         };
 
-        match update {
-            SessionMessage::SessionMessage(dispatch) => {
-                let ui_session_id = ui_session_id.to_string();
-                MatchDispatch::new(dispatch)
-                    .if_notification(async move |notif: SessionNotification| {
-                        if let Some(json) = ws_outbound::map_session_notification(
-                            &notif,
-                            &ui_session_id,
-                            provider,
-                        ) {
-                            let _ = event_tx.send(json);
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .otherwise_ignore()?;
-            }
-            SessionMessage::StopReason(_) => break,
-            #[allow(unreachable_patterns)]
-            _ => {}
+        if forward_session_update(update, event_tx, ui_session_id, provider)
+            .await?
+        {
+            break;
         }
     }
     Ok(())

@@ -26,7 +26,9 @@ function ChatInterface({
   selectedSession,
   ws,
   sendMessage,
+  messageSeq,
   latestMessage,
+  drainMessagesSince,
   onFileOpen,
   onInputFocusChange,
   onSessionActive,
@@ -51,6 +53,8 @@ function ChatInterface({
   const sessionStore = useSessionStore();
   const streamTimerRef = useRef<number | null>(null);
   const accumulatedStreamRef = useRef('');
+  const thinkingTimerRef = useRef<number | null>(null);
+  const accumulatedThinkingRef = useRef('');
   const pendingViewSessionRef = useRef<PendingViewSession | null>(null);
 
   const resetStreamingState = useCallback(() => {
@@ -59,6 +63,11 @@ function ChatInterface({
       streamTimerRef.current = null;
     }
     accumulatedStreamRef.current = '';
+    if (thinkingTimerRef.current) {
+      clearTimeout(thinkingTimerRef.current);
+      thinkingTimerRef.current = null;
+    }
+    accumulatedThinkingRef.current = '';
   }, []);
 
   const {
@@ -220,7 +229,9 @@ function ChatInterface({
   }, [selectedProject, selectedSession, sessionStore, setIsLoading, setCanAbortSession]);
 
   useChatRealtimeHandlers({
+    messageSeq,
     latestMessage,
+    drainMessagesSince,
     provider,
     selectedSession,
     currentSessionId,
@@ -233,6 +244,8 @@ function ChatInterface({
     pendingViewSessionRef,
     streamTimerRef,
     accumulatedStreamRef,
+    thinkingTimerRef,
+    accumulatedThinkingRef,
     onSessionInactive,
     onSessionProcessing,
     onSessionNotProcessing,

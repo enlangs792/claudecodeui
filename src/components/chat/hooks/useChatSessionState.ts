@@ -697,6 +697,32 @@ export function useChatSessionState({
     }
   }, [currentSessionId, isLoading, processingSessions, selectedSession?.id]);
 
+  useEffect(() => {
+    if (!ws || !isLoading || !currentSessionId) {
+      return;
+    }
+
+    const provider =
+      (selectedSession?.__provider || (localStorage.getItem('selected-provider') as Provider) || 'claude');
+
+    // Guard against stale loading when the backend session has already ended
+    // (for example ACP startup/auth failure before stream/complete reaches UI).
+    const emitStatusCheck = () => {
+      sendMessage({
+        type: 'check-session-status',
+        sessionId: currentSessionId,
+        provider,
+      });
+    };
+
+    emitStatusCheck();
+    const intervalId = window.setInterval(emitStatusCheck, 5000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [currentSessionId, isLoading, selectedSession?.__provider, sendMessage, ws]);
+
   // "Load all" overlay
   const prevLoadingRef = useRef(false);
   useEffect(() => {

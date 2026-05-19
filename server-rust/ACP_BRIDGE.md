@@ -58,6 +58,24 @@ CARGO_TARGET_DIR=./target cargo run --bin cloudcli-server
 # Connect to /ws?token=... and send claude-command (see checklist above).
 ```
 
+## VS Code debugging
+
+Launch configs live in `.vscode/launch.json` (JSONC). Build tasks: `.vscode/tasks.json`.
+
+| Launch / compound | Use when |
+|-------------------|----------|
+| **Full stack: Mock Claude + Vite** | Offline UI + WS chat (no API keys); uses `mock-acp-agent` as Claude ACP. Open http://localhost:5173 |
+| **Full stack: ACP server + Vite** | HMR frontend + real ACP defaults for all installed providers |
+| **ACP server + Mock Claude** | Server only; mock agent for `claude-command` |
+| **ACP: Claude (real CLI)** | `npx @agentclientprotocol/claude-agent-acp`; set `ANTHROPIC_API_KEY` in repo `.env` |
+| **ACP: Gemini** | Requires `gemini` CLI with `--acp` |
+| **ACP: Cursor** | Requires `agent acp` (Cursor CLI) |
+| **ACP: Codex** | Requires `codex-acp` on `PATH` |
+
+Defaults: Rust API/WebSocket on port **3001**, Vite on **5173** (proxies `/api` and `/ws` to the server). Local DB: `.cloudcli-dev/database.sqlite` (`DATABASE_PATH` in launch env).
+
+Copy `.env.example` → `.env` for `SERVER_PORT`, `VITE_PORT`, and provider API keys. Set `CLOUDCLI_ACP_DEBUG=1` in `.env` or launch `env` to log ACP stdio.
+
 ## CI note
 
 Mapper unit tests run in CI. Full bridge E2E uses `mock-acp-agent`. Real `claude-agent-acp` smoke tests need Node 18+, `npx @agentclientprotocol/claude-agent-acp`, and `ANTHROPIC_API_KEY`.

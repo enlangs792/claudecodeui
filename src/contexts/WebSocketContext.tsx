@@ -1,11 +1,21 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '../components/auth/context/AuthContext';
 import { IS_PLATFORM } from '../constants/config';
+import { appendInboundFrame, collectFramesSince } from './wsFrameBuffer';
+import {
+  createWebSocketLifecycleState,
+  type WebSocketLifecycleState,
+} from './webSocketLifecycle';
 
 type WebSocketContextType = {
   ws: WebSocket | null;
-  sendMessage: (message: any) => void;
+  sendMessage: (message: any) => boolean;
+  /** Monotonic counter; increments for every inbound WS frame (avoids coalescing drops). */
+  messageSeq: number;
+  /** Most recent inbound message (same as last element processed for this seq). */
   latestMessage: any | null;
+  /** Return all inbound frames with seq greater than `lastSeq`. */
+  drainMessagesSince: (lastSeq: number) => Array<{ seq: number; message: any }>;
   isConnected: boolean;
 };
 
@@ -28,18 +38,35 @@ const buildWebSocketUrl = (token: string | null) => {
 
 const useWebSocketProviderState = (): WebSocketContextType => {
   const wsRef = useRef<WebSocket | null>(null);
-  const unmountedRef = useRef(false); // Track if component is unmounted
+  const lifecycleRef = useRef<WebSocketLifecycleState>(createWebSocketLifecycleState());
   const hasConnectedRef = useRef(false); // Track if we've ever connected (to detect reconnects)
+  const inboundFramesRef = useRef<Array<{ seq: number; message: any }>>([]);
+  const seqRef = useRef(0);
   const [latestMessage, setLatestMessage] = useState<any>(null);
+  const [messageSeq, setMessageSeq] = useState(0);
   const [isConnected, setIsConnected] = useState(false);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const { token } = useAuth();
 
   useEffect(() => {
     connect();
-    
+
     return () => {
-      unmountedRef.current = true;
+      lifecycleRef.current.onTokenEffectCleanup();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [token]); // everytime token changes, we reconnect
+
+  useEffect(() => {
+    return () => {
+      lifecycleRef.current.onProviderUnmount();
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
@@ -47,10 +74,10 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         wsRef.current.close();
       }
     };
-  }, [token]); // everytime token changes, we reconnect
+  }, []);
 
   const connect = useCallback(() => {
-    if (unmountedRef.current) return; // Prevent connection if unmounted
+    if (!lifecycleRef.current.canConnect()) return; // Prevent connection if unmounted
     try {
       // Construct WebSocket URL
       const wsUrl = buildWebSocketUrl(token);
@@ -65,6 +92,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         if (hasConnectedRef.current) {
           // This is a reconnect — signal so components can catch up on missed messages
           setLatestMessage({ type: 'websocket-reconnected', timestamp: Date.now() });
+          setMessageSeq((seq) => seq + 1);
         }
         hasConnectedRef.current = true;
       };
@@ -72,7 +100,13 @@ const useWebSocketProviderState = (): WebSocketContextType => {
       websocket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          seqRef.current += 1;
+          inboundFramesRef.current = appendInboundFrame(inboundFramesRef.current, {
+            seq: seqRef.current,
+            message: data,
+          });
           setLatestMessage(data);
+          setMessageSeq(seqRef.current);
         } catch (error) {
           console.error('Error parsing WebSocket message:', error);
         }
@@ -84,7 +118,7 @@ const useWebSocketProviderState = (): WebSocketContextType => {
         
         // Attempt to reconnect after 3 seconds
         reconnectTimeoutRef.current = setTimeout(() => {
-          if (unmountedRef.current) return; // Prevent reconnection if unmounted
+          if (!lifecycleRef.current.canConnect()) return; // Prevent reconnection if unmounted
           connect();
         }, 3000);
       };
@@ -102,18 +136,26 @@ const useWebSocketProviderState = (): WebSocketContextType => {
     const socket = wsRef.current;
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
+      return true;
     } else {
       console.warn('WebSocket not connected');
+      return false;
     }
+  }, []);
+
+  const drainMessagesSince = useCallback((lastSeq: number) => {
+    return collectFramesSince(inboundFramesRef.current, lastSeq);
   }, []);
 
   const value: WebSocketContextType = useMemo(() =>
   ({
     ws: wsRef.current,
     sendMessage,
+    messageSeq,
     latestMessage,
+    drainMessagesSince,
     isConnected
-  }), [sendMessage, latestMessage, isConnected]);
+  }), [sendMessage, messageSeq, latestMessage, drainMessagesSince, isConnected]);
 
   return value;
 };

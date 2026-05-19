@@ -106,8 +106,10 @@ export interface ChatInterfaceProps {
   selectedProject: Project | null;
   selectedSession: ProjectSession | null;
   ws: WebSocket | null;
-  sendMessage: (message: unknown) => void;
+  sendMessage: (message: unknown) => boolean;
+  messageSeq: number;
   latestMessage: any;
+  drainMessagesSince: (lastSeq: number) => Array<{ seq: number; message: any }>;
   onFileOpen?: (filePath: string, diffInfo?: any) => void;
   onInputFocusChange?: (focused: boolean) => void;
   onSessionActive?: (sessionId?: string | null) => void;

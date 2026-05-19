@@ -76,6 +76,12 @@ pub fn parse_provider_command(
     let skip_permissions = options
         .and_then(|o| o.get("skipPermissions"))
         .and_then(|v| v.as_bool())
+        .or_else(|| {
+            options
+                .and_then(|o| o.get("toolsSettings"))
+                .and_then(|t| t.get("skipPermissions"))
+                .and_then(|v| v.as_bool())
+        })
         .unwrap_or(false);
 
     let trust = options

@@ -132,6 +132,7 @@ export function normalizedToChatMessages(messages: NormalizedMessage[]): ChatMes
             content: unescapeWithMathProtection(msg.content),
             timestamp: msg.timestamp,
             isThinking: true,
+            isStreaming: msg.id.startsWith('__thinking_'),
             ...sharedMetadata,
           });
         }

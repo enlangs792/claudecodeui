@@ -37,7 +37,9 @@ function MainContent({
   setActiveTab,
   ws,
   sendMessage,
+  messageSeq,
   latestMessage,
+  drainMessagesSince,
   isMobile,
   onMenuClick,
   isLoading,
@@ -128,7 +130,9 @@ function MainContent({
                 selectedSession={selectedSession}
                 ws={ws}
                 sendMessage={sendMessage}
+                messageSeq={messageSeq}
                 latestMessage={latestMessage}
+                drainMessagesSince={drainMessagesSince}
                 onFileOpen={handleFileOpen}
                 onInputFocusChange={onInputFocusChange}
                 onSessionActive={onSessionActive}

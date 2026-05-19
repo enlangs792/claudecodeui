@@ -45,7 +45,7 @@ interface UseChatComposerStateArgs {
   isLoading: boolean;
   canAbortSession: boolean;
   tokenBudget: Record<string, unknown> | null;
-  sendMessage: (message: unknown) => void;
+  sendMessage: (message: unknown) => boolean;
   sendByCtrlEnter?: boolean;
   onSessionActive?: (sessionId?: string | null) => void;
   onSessionProcessing?: (sessionId?: string | null) => void;
@@ -598,8 +598,9 @@ export function useChatComposerState({
       const resolvedProjectPath = selectedProject.fullPath || selectedProject.path || '';
       const sessionSummary = getNotificationSessionSummary(selectedSession, currentInput);
 
+      let outboundMessage: Record<string, unknown>;
       if (provider === 'cursor') {
-        sendMessage({
+        outboundMessage = {
           type: 'cursor-command',
           command: messageContent,
           sessionId: effectiveSessionId,
@@ -613,9 +614,9 @@ export function useChatComposerState({
             sessionSummary,
             toolsSettings,
           },
-        });
+        };
       } else if (provider === 'codex') {
-        sendMessage({
+        outboundMessage = {
           type: 'codex-command',
           command: messageContent,
           sessionId: effectiveSessionId,
@@ -628,9 +629,9 @@ export function useChatComposerState({
             sessionSummary,
             permissionMode: permissionMode === 'plan' ? 'default' : permissionMode,
           },
-        });
+        };
       } else if (provider === 'gemini') {
-        sendMessage({
+        outboundMessage = {
           type: 'gemini-command',
           command: messageContent,
           sessionId: effectiveSessionId,
@@ -644,9 +645,9 @@ export function useChatComposerState({
             permissionMode,
             toolsSettings,
           },
-        });
+        };
       } else {
-        sendMessage({
+        outboundMessage = {
           type: 'claude-command',
           command: messageContent,
           options: {
@@ -661,7 +662,20 @@ export function useChatComposerState({
             images: uploadedImages,
             effortLevel,
           },
+        };
+      }
+
+      const sent = sendMessage(outboundMessage);
+      if (!sent) {
+        setIsLoading(false);
+        setCanAbortSession(false);
+        setClaudeStatus(null);
+        addMessage({
+          type: 'error',
+          content: 'WebSocket disconnected. Please wait for reconnect and retry.',
+          timestamp: new Date(),
         });
+        return;
       }
 
       setInput('');

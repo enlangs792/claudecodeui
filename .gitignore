@@ -12,6 +12,7 @@ dist-server/
 dist-ssr/
 build/
 out/
+.cloudcli-dev/
 
 # Environment variables
 .env
