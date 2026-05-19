@@ -1,12 +1,12 @@
 # ACP Bridge (Rust server)
 
-The Rust server can route WebSocket chat through [Agent Client Protocol](https://agentclientprotocol.com/) agents instead of parsing CLI `stream-json` output.
+The Rust server routes WebSocket chat through [Agent Client Protocol](https://agentclientprotocol.com/) agents.
 
 ## Enable / disable
 
 | Variable | Default (with `acp-bridge` feature) | Description |
 |----------|--------------------------------------|-------------|
-| `CLOUDCLI_ACP_BRIDGE` | enabled (`1`) | Set to `0` / `false` to use legacy CLI agents (requires `legacy-cli-agents` feature at build time). |
+| `CLOUDCLI_ACP_BRIDGE` | enabled (`1`) | Set to `0` / `false` to disable ACP routing (WS chat will ack unknown messages only). |
 | `CLOUDCLI_ACP_DEBUG` | off | Log ACP stdio lines. |
 | `CLOUDCLI_NODE_PATH` | `node` | Node binary for Claude (`npx` agent). |
 | `CLOUDCLI_MANAGED_NODE` | off | Reserved for bundled Node (Phase 4). |
@@ -21,23 +21,19 @@ Per-provider overrides:
 | `CLOUDCLI_ACP_CODEX_CMD` | `codex-acp` |
 | `CLOUDCLI_ACP_<PROVIDER>_ENABLED` | `1` | Set to `0` to disable a provider on the bridge. |
 
-## Build features
+## Build
 
 ```bash
-# Default: ACP bridge only
+# Default: ACP bridge (required for /ws chat)
 cargo build -p cloudcli-server
-
-# Legacy CLI stream-json agents (rollback)
-cargo build -p cloudcli-server --no-default-features --features legacy-cli-agents
-
-# Both paths
-cargo build -p cloudcli-server --features acp-bridge,legacy-cli-agents
 ```
+
+Legacy CLI `stream-json` agents were removed; the `acp-bridge` feature is required.
 
 ## Manual E2E checklist
 
 1. Install prerequisites: Node 18+, and provider CLIs or npx packages above.
-2. Start server: `CLOUDCLI_ACP_BRIDGE=1 cargo run -p cloudcli-server`
+2. Start server: `cargo run -p cloudcli-server`
 3. Connect frontend to `/ws` with auth token.
 4. **Claude:** send `claude-command` with `options.cwd` — expect `session_created`, `stream_delta` / `text`, `complete`.
 5. **Permissions:** tool that requires approval — expect `permission_request`; reply with `claude-permission-response`.

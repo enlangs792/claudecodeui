@@ -5,8 +5,6 @@ mod ws;
 mod providers;
 mod services;
 mod shared;
-#[cfg(any(feature = "legacy-cli-agents", not(feature = "acp-bridge")))]
-mod agents;
 #[cfg(feature = "acp-bridge")]
 mod acp;
 

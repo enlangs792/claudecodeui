@@ -20,12 +20,5 @@ pub use bridge::AcpBridge;
 
 /// Whether the ACP bridge path is active at runtime.
 pub fn acp_enabled() -> bool {
-    #[cfg(feature = "acp-bridge")]
-    {
-        crate::acp::config::acp_bridge_enabled()
-    }
-    #[cfg(not(feature = "acp-bridge"))]
-    {
-        false
-    }
+    crate::acp::config::acp_bridge_enabled()
 }

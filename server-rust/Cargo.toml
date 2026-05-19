@@ -8,7 +8,6 @@ default-run = "cloudcli-server"
 
 [features]
 default = ["acp-bridge"]
-legacy-cli-agents = []
 acp-bridge = [
     "dep:agent-client-protocol",
     "dep:agent-client-protocol-tokio",
