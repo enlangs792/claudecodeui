@@ -86,7 +86,7 @@ pub async fn spawn_cursor(
     let mut child = Command::new("cursor-agent")
         .args(&args)
         .current_dir(&working_dir)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

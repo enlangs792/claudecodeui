@@ -5,6 +5,10 @@ mod ws;
 mod providers;
 mod services;
 mod shared;
+#[cfg(any(feature = "legacy-cli-agents", not(feature = "acp-bridge")))]
+mod agents;
+#[cfg(feature = "acp-bridge")]
+mod acp;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +38,9 @@ async fn main() -> anyhow::Result<()> {
     // Initialize database pool and run migrations
     init_pool();
     initialize_database();
+
+    // Sync existing agent session data at startup (matching TS initializeSessionsWatcher)
+    startup_session_sync().await;
 
     let app_root = find_app_root();
     tracing::info!("App root resolved to: {}", app_root.display());
@@ -197,6 +204,36 @@ async fn health_check() -> Json<Value> {
         "installMode": "git",
         "server": "rust"
     }))
+}
+
+/// Sync existing agent session data at startup (matching TS initializeSessionsWatcher).
+async fn startup_session_sync() {
+    let provider_registry = ProviderRegistry::new();
+    tracing::info!("Starting initial session synchronization across all providers...");
+
+    let providers = provider_registry.list_all();
+    for provider in providers {
+        let id = provider.id();
+        let synchronizer = provider.session_synchronizer();
+        match synchronizer.synchronize(None).await {
+            Ok(count) => {
+                tracing::info!(
+                    "Session sync complete for {}: {} files processed",
+                    id.as_str(),
+                    count
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Session sync failed for {}: {}",
+                    id.as_str(),
+                    e
+                );
+            }
+        }
+    }
+
+    tracing::info!("Initial session synchronization complete");
 }
 
 /// POST /api/system/update — run system update (git pull or npm update)

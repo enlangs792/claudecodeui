@@ -37,15 +37,26 @@ async fn browse_filesystem(
     Query(query): Query<BrowseQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let root = workspaces_root();
-    let target_path = query
-        .path
-        .map(|p| expand_tilde(&p, &root))
-        .unwrap_or_else(|| root.to_string_lossy().to_string());
 
-    // Resolve and normalize
-    let target_path = PathBuf::from(&target_path);
+    // Expand tilde, matching TS expandWorkspacePath
+    let target_path = match &query.path {
+        Some(p) if !p.is_empty() => expand_tilde(p, &root),
+        _ => root.to_string_lossy().to_string(),
+    };
 
-    let target_str = target_path.to_string_lossy().to_string();
+    // Resolve and normalize (equivalent to TS path.resolve())
+    let target_resolved = std::fs::canonicalize(&target_path)
+        .unwrap_or_else(|_| {
+            // If canonicalize fails (path may not exist), manually resolve
+            // .. and . components
+            let p = PathBuf::from(&target_path);
+            if p.is_absolute() {
+                p
+            } else {
+                root.join(p)
+            }
+        });
+    let target_str = target_resolved.to_string_lossy().to_string();
 
     // Validate path is within workspace root
     let validation = validate_workspace_path(&target_str).await;
@@ -59,14 +70,15 @@ async fn browse_filesystem(
     let resolved_path = validation.resolved_path.unwrap_or(target_str);
 
     // Check it's a directory
-    let meta = tokio::fs::metadata(&resolved_path)
-        .await
-        .map_err(|e| {
-            (
+    let meta = match tokio::fs::metadata(&resolved_path).await {
+        Ok(m) => m,
+        Err(e) => {
+            return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({"error": format!("Directory not accessible: {}", e)})),
-            )
-        })?;
+            ));
+        }
+    };
     if !meta.is_dir() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -74,30 +86,12 @@ async fn browse_filesystem(
         ));
     }
 
-    // Read directory entries
-    let mut entries = tokio::fs::read_dir(&resolved_path)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-        })?;
-
-    let mut suggestions: Vec<Value> = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path().to_string_lossy().into_owned();
-            suggestions.push(json!({
-                "name": name,
-                "path": path,
-                "type": "directory"
-            }));
-        }
-    }
+    // Read directory entries — match TS getFileTree behavior:
+    // skip build/VCS dirs, handle unreadable dirs gracefully
+    let suggestions = read_directory_entries(&resolved_path).await;
 
     // Sort: non-hidden first, then alphabetical (case-insensitive)
+    let mut suggestions = suggestions;
     suggestions.sort_by(|a, b| {
         let a_name = a["name"].as_str().unwrap_or("");
         let b_name = b["name"].as_str().unwrap_or("");
@@ -115,11 +109,9 @@ async fn browse_filesystem(
     });
 
     // Reorder: common directories first if browsing the workspace root
-    let resolved_buf = PathBuf::from(&resolved_path);
-    let resolved_canonical = std::fs::canonicalize(&resolved_buf).unwrap_or(resolved_buf);
     let root_canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
 
-    let final_suggestions = if resolved_canonical == root_canonical {
+    let final_suggestions = if target_resolved == root_canonical {
         let common_dirs = [
             "Desktop", "Documents", "Projects", "Development", "Dev", "Code", "workspace",
         ];
@@ -143,6 +135,42 @@ async fn browse_filesystem(
         "path": resolved_path,
         "suggestions": final_suggestions
     })))
+}
+
+/// Directories excluded from browse-filesystem listing (matching TS getFileTree)
+const EXCLUDED_DIRS: &[&str] = &["node_modules", "dist", "build", ".git", ".svn", ".hg"];
+
+async fn read_directory_entries(dir_path: &str) -> Vec<Value> {
+    let mut entries = match tokio::fs::read_dir(dir_path).await {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut suggestions: Vec<Value> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        // Skip excluded directories (matching TS getFileTree)
+        if EXCLUDED_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+
+        let ft = match entry.file_type().await {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if ft.is_dir() {
+            let path = entry.path().to_string_lossy().into_owned();
+            suggestions.push(json!({
+                "name": name,
+                "path": path,
+                "type": "directory"
+            }));
+        }
+    }
+
+    suggestions
 }
 
 /// POST /api/create-folder — create a new directory

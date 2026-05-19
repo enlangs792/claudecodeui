@@ -57,35 +57,192 @@ pub struct ClaudeAuth;
 impl IProviderAuth for ClaudeAuth {
     async fn get_status(&self) -> anyhow::Result<ProviderAuthStatus> {
         let installed = check_claude_installed();
-        let authenticated = if installed {
-            check_claude_login().await.unwrap_or(false)
-        } else {
-            false
-        };
+
+        if !installed {
+            return Ok(ProviderAuthStatus {
+                installed: false,
+                provider: LlmProvider::Claude,
+                authenticated: false,
+                email: None,
+                method: None,
+                error: Some("Claude Code CLI is not installed".into()),
+            });
+        }
+
+        let credentials = check_claude_credentials().await;
 
         Ok(ProviderAuthStatus {
             installed,
             provider: LlmProvider::Claude,
-            authenticated,
-            email: None,
-            method: Some("oauth".into()),
-            error: None,
+            authenticated: credentials.authenticated,
+            email: if credentials.authenticated {
+                Some(credentials.email.unwrap_or_else(|| "Authenticated".into()))
+            } else {
+                credentials.email
+            },
+            method: credentials.method,
+            error: if credentials.authenticated { None } else { credentials.error.or(Some("Not authenticated".into())) },
         })
     }
 }
 
 fn check_claude_installed() -> bool {
-    std::process::Command::new("claude")
+    let cli_path = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".into());
+    std::process::Command::new(&cli_path)
         .arg("--version")
-        .output()
-        .map(|o| o.status.success())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
         .unwrap_or(false)
 }
 
-async fn check_claude_login() -> Option<bool> {
-    let home = dirs::home_dir()?;
-    let credentials_path = home.join(".claude").join("credentials.json");
-    tokio::fs::metadata(&credentials_path).await.ok().map(|_| true)
+struct ClaudeCredentialStatus {
+    authenticated: bool,
+    email: Option<String>,
+    method: Option<String>,
+    error: Option<String>,
+}
+
+async fn check_claude_credentials() -> ClaudeCredentialStatus {
+    // 1. Check ANTHROPIC_API_KEY in process env
+    if let Ok(val) = std::env::var("ANTHROPIC_API_KEY") {
+        if !val.trim().is_empty() {
+            return ClaudeCredentialStatus {
+                authenticated: true,
+                email: Some("API Key Auth".into()),
+                method: Some("api_key".into()),
+                error: None,
+            };
+        }
+    }
+
+    // 2. Read ~/.claude/settings.json for env vars
+    let settings_env = load_claude_settings_env().await;
+
+    if let Some(val) = settings_env.get("ANTHROPIC_API_KEY") {
+        if !val.is_empty() {
+            return ClaudeCredentialStatus {
+                authenticated: true,
+                email: Some("API Key Auth".into()),
+                method: Some("api_key".into()),
+                error: None,
+            };
+        }
+    }
+
+    if let Some(val) = settings_env.get("ANTHROPIC_AUTH_TOKEN") {
+        if !val.is_empty() {
+            return ClaudeCredentialStatus {
+                authenticated: true,
+                email: Some("Configured via settings.json".into()),
+                method: Some("api_key".into()),
+                error: None,
+            };
+        }
+    }
+
+    // 3. Read ~/.claude/.credentials.json for OAuth tokens
+    check_claude_oauth_credentials().await
+}
+
+async fn load_claude_settings_env() -> std::collections::HashMap<String, String> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return std::collections::HashMap::new(),
+    };
+    let settings_path = home.join(".claude").join("settings.json");
+
+    let content = match tokio::fs::read_to_string(&settings_path).await {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    let settings: Value = serde_json::from_str(&content).unwrap_or_default();
+    let env_obj = match settings.get("env").and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return std::collections::HashMap::new(),
+    };
+
+    let mut map = std::collections::HashMap::new();
+    for (k, v) in env_obj {
+        if let Some(s) = v.as_str() {
+            map.insert(k.clone(), s.to_string());
+        }
+    }
+    map
+}
+
+async fn check_claude_oauth_credentials() -> ClaudeCredentialStatus {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return ClaudeCredentialStatus {
+            authenticated: false,
+            email: None,
+            method: None,
+            error: None,
+        },
+    };
+
+    let cred_path = home.join(".claude").join(".credentials.json");
+    let content = match tokio::fs::read_to_string(&cred_path).await {
+        Ok(c) => c,
+        Err(_) => return ClaudeCredentialStatus {
+            authenticated: false,
+            email: None,
+            method: None,
+            error: None,
+        },
+    };
+
+    let creds: Value = serde_json::from_str(&content).unwrap_or_default();
+    let oauth = match creds.get("claudeAiOauth").and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return ClaudeCredentialStatus {
+            authenticated: false,
+            email: None,
+            method: None,
+            error: None,
+        },
+    };
+
+    let access_token = oauth.get("accessToken").and_then(|v| v.as_str());
+    if access_token.is_none() || access_token == Some("") {
+        return ClaudeCredentialStatus {
+            authenticated: false,
+            email: None,
+            method: None,
+            error: None,
+        };
+    }
+
+    let expires_at = oauth.get("expiresAt").and_then(|v| v.as_f64());
+    let email = creds.get("email")
+        .and_then(|v| v.as_str())
+        .or_else(|| creds.get("user").and_then(|v| v.as_str()))
+        .map(String::from);
+
+    if let Some(exp) = expires_at {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        if now_ms >= exp {
+            return ClaudeCredentialStatus {
+                authenticated: false,
+                email,
+                method: Some("credentials_file".into()),
+                error: Some("OAuth token has expired. Please re-authenticate with claude login".into()),
+            };
+        }
+    }
+
+    ClaudeCredentialStatus {
+        authenticated: true,
+        email: email.or_else(|| Some("Authenticated".into())),
+        method: Some("credentials_file".into()),
+        error: None,
+    }
 }
 
 // ── MCP ──────────────────────────────────────────────────────────────────────
@@ -344,12 +501,18 @@ impl IProviderSessionSynchronizer for ClaudeSessionSynchronizer {
         let path = std::path::Path::new(&file_path);
         let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
 
-        crate::db::repos::sessions::SessionsRepo::upsert(
-            session_id,
-            "claude",
+        let project_path = crate::shared::utils::extract_project_path_from_session_file(
+            path,
             &std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("/"))
                 .to_string_lossy(),
+        )
+        .await;
+
+        crate::db::repos::sessions::SessionsRepo::upsert(
+            session_id,
+            "claude",
+            &project_path,
             None,
             Some(&file_path),
         );

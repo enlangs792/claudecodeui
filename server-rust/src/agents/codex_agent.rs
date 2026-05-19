@@ -76,7 +76,7 @@ pub async fn spawn_codex(
     let mut child = Command::new("codex")
         .args(&args)
         .current_dir(&working_dir)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

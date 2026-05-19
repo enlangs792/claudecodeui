@@ -47,25 +47,129 @@ pub struct CursorAuth;
 #[async_trait]
 impl IProviderAuth for CursorAuth {
     async fn get_status(&self) -> anyhow::Result<ProviderAuthStatus> {
-        let installed = std::process::Command::new("cursor-agent")
-            .arg("--version")
-            .output()
-            .is_ok();
-        let home = dirs::home_dir();
-        let authenticated = home
-            .as_ref()
-            .map(|h| h.join(".cursor").join("credentials.json").exists())
-            .unwrap_or(false);
+        let installed = check_cursor_installed();
+
+        if !installed {
+            return Ok(ProviderAuthStatus {
+                installed: false,
+                provider: LlmProvider::Cursor,
+                authenticated: false,
+                email: None,
+                method: None,
+                error: Some("Cursor CLI is not installed".into()),
+            });
+        }
+
+        let login = check_cursor_login().await;
 
         Ok(ProviderAuthStatus {
             installed,
             provider: LlmProvider::Cursor,
-            authenticated,
-            email: None,
-            method: Some("token".into()),
-            error: None,
+            authenticated: login.authenticated,
+            email: login.email,
+            method: login.method,
+            error: if login.authenticated { None } else { login.error.or(Some("Not logged in".into())) },
         })
     }
+}
+
+fn check_cursor_installed() -> bool {
+    std::process::Command::new("cursor-agent")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+struct CursorLoginStatus {
+    authenticated: bool,
+    email: Option<String>,
+    method: Option<String>,
+    error: Option<String>,
+}
+
+async fn check_cursor_login() -> CursorLoginStatus {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new("cursor-agent")
+            .arg("status")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await;
+
+    match output {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Parse "Logged in as <email>" pattern
+                let email = extract_email_from_login(&stdout);
+                if let Some(email) = email {
+                    return CursorLoginStatus {
+                        authenticated: true,
+                        email: Some(email),
+                        method: Some("cli".into()),
+                        error: None,
+                    };
+                }
+
+                if stdout.contains("Logged in") {
+                    return CursorLoginStatus {
+                        authenticated: true,
+                        email: Some("Logged in".into()),
+                        method: Some("cli".into()),
+                        error: None,
+                    };
+                }
+
+                CursorLoginStatus {
+                    authenticated: false,
+                    email: None,
+                    method: None,
+                    error: Some("Not logged in".into()),
+                }
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                CursorLoginStatus {
+                    authenticated: false,
+                    email: None,
+                    method: None,
+                    error: Some(if stderr.is_empty() { "Not logged in".into() } else { stderr.to_string() }),
+                }
+            }
+        }
+        Ok(Err(_)) => CursorLoginStatus {
+            authenticated: false,
+            email: None,
+            method: None,
+            error: Some("Cursor CLI not found or not installed".into()),
+        },
+        Err(_) => CursorLoginStatus {
+            authenticated: false,
+            email: None,
+            method: None,
+            error: Some("Command timeout".into()),
+        },
+    }
+}
+
+fn extract_email_from_login(stdout: &str) -> Option<String> {
+    // Find "Logged in as " prefix
+    if let Some(pos) = stdout.find("Logged in as ") {
+        let after = &stdout[pos + "Logged in as ".len()..];
+        // Extract email: word chars, @, domain chars, dot, TLD
+        let end = after
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(after.len());
+        let candidate = &after[..end];
+        if candidate.contains('@') && candidate.contains('.') {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 // ── MCP ──────────────────────────────────────────────────────────────────────
@@ -266,10 +370,10 @@ pub struct CursorSessionSynchronizer;
 impl IProviderSessionSynchronizer for CursorSessionSynchronizer {
     async fn synchronize(&self, since: Option<chrono::DateTime<chrono::Utc>>) -> anyhow::Result<usize> {
         let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Home not found"))?;
-        let sessions_dir = home.join(".cursor").join("sessions");
+        let projects_dir = home.join(".cursor").join("projects");
 
         let jsonl_files = crate::shared::utils::find_files_recursively_created_after(
-            &sessions_dir, ".jsonl", since,
+            &projects_dir, ".jsonl", since,
         )
         .await;
 
@@ -285,12 +389,18 @@ impl IProviderSessionSynchronizer for CursorSessionSynchronizer {
         let path = std::path::Path::new(&file_path);
         let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
 
-        crate::db::repos::sessions::SessionsRepo::upsert(
-            session_id,
-            "cursor",
+        let project_path = crate::shared::utils::extract_project_path_from_session_file(
+            path,
             &std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("/"))
                 .to_string_lossy(),
+        )
+        .await;
+
+        crate::db::repos::sessions::SessionsRepo::upsert(
+            session_id,
+            "cursor",
+            &project_path,
             None,
             Some(&file_path),
         );

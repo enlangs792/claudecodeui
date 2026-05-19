@@ -378,6 +378,42 @@ pub fn normalize_session_name(raw: Option<&str>, fallback: &str) -> String {
     }
 }
 
+/// Extract project path from a session .jsonl file by reading the `cwd` field
+/// from the first JSON line. Falls back to the provided fallback_path when
+/// extraction fails.
+pub async fn extract_project_path_from_session_file(
+    jsonl_path: &Path,
+    fallback_path: &str,
+) -> String {
+    if let Ok(content) = tokio::fs::read_to_string(jsonl_path).await {
+        for line in content.lines().take(5) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                if let Some(cwd) = val
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return cwd.to_string();
+                }
+                // Some formats use "projectPath" instead of "cwd"
+                if let Some(pp) = val
+                    .get("projectPath")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    return pp.to_string();
+                }
+            }
+            break; // Only check the first non-empty line
+        }
+    }
+    fallback_path.to_string()
+}
+
 /// Find files matching an extension, optionally filtered by creation time
 pub async fn find_files_recursively_created_after(
     root_dir: &Path,

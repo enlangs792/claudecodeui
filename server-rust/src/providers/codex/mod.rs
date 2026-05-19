@@ -47,28 +47,140 @@ pub struct CodexAuth;
 #[async_trait]
 impl IProviderAuth for CodexAuth {
     async fn get_status(&self) -> anyhow::Result<ProviderAuthStatus> {
-        let installed = std::process::Command::new("codex")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        let authenticated = if installed {
-            dirs::home_dir()
-                .map(|h| h.join(".codex").join("credentials.json").exists())
-                .unwrap_or(false)
-        } else {
-            false
-        };
+        let installed = check_codex_installed();
+        let credentials = check_codex_credentials().await;
 
         Ok(ProviderAuthStatus {
             installed,
             provider: LlmProvider::Codex,
-            authenticated,
-            email: None,
-            method: Some("oauth".into()),
-            error: None,
+            authenticated: credentials.authenticated,
+            email: credentials.email,
+            method: credentials.method,
+            error: if credentials.authenticated { None } else { credentials.error.or(Some("Not authenticated".into())) },
         })
     }
+}
+
+fn check_codex_installed() -> bool {
+    std::process::Command::new("codex")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+struct CodexCredentialStatus {
+    authenticated: bool,
+    email: Option<String>,
+    method: Option<String>,
+    error: Option<String>,
+}
+
+async fn check_codex_credentials() -> CodexCredentialStatus {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
+        None => return CodexCredentialStatus {
+            authenticated: false,
+            email: None,
+            method: None,
+            error: Some("Home directory not found".into()),
+        },
+    };
+
+    let auth_path = home.join(".codex").join("auth.json");
+    let content = match tokio::fs::read_to_string(&auth_path).await {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                "Codex not configured".to_string()
+            } else {
+                format!("Failed to read Codex auth: {}", e)
+            };
+            return CodexCredentialStatus {
+                authenticated: false,
+                email: None,
+                method: None,
+                error: Some(msg),
+            };
+        }
+    };
+
+    let auth: Value = serde_json::from_str(&content).unwrap_or_default();
+
+    // Check OAuth tokens (id_token or access_token)
+    if let Some(tokens) = auth.get("tokens").and_then(|v| v.as_object()) {
+        let id_token = tokens.get("id_token").and_then(|v| v.as_str());
+        let access_token = tokens.get("access_token").and_then(|v| v.as_str());
+
+        if let Some(token) = id_token.or(access_token) {
+            let email = if id_token.is_some() {
+                read_email_from_id_token(id_token.unwrap())
+            } else {
+                Some("Authenticated".into())
+            };
+
+            return CodexCredentialStatus {
+                authenticated: true,
+                email,
+                method: Some("credentials_file".into()),
+                error: None,
+            };
+        }
+    }
+
+    // Fallback: OPENAI_API_KEY in auth.json
+    if let Some(key) = auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()) {
+        if !key.is_empty() {
+            return CodexCredentialStatus {
+                authenticated: true,
+                email: Some("API Key Auth".into()),
+                method: Some("api_key".into()),
+                error: None,
+            };
+        }
+    }
+
+    CodexCredentialStatus {
+        authenticated: false,
+        email: None,
+        method: None,
+        error: Some("No valid tokens found".into()),
+    }
+}
+
+fn read_email_from_id_token(id_token: &str) -> Option<String> {
+    let parts: Vec<&str> = id_token.split('.').collect();
+    if parts.len() < 2 {
+        return Some("Authenticated".into());
+    }
+
+    let payload_str = base64url_decode(parts[1]).unwrap_or_default();
+    let payload: Value = serde_json::from_str(&payload_str).unwrap_or_default();
+
+    payload.get("email")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.get("user").and_then(|v| v.as_str()))
+        .map(String::from)
+        .or(Some("Authenticated".into()))
+}
+
+fn base64url_decode(input: &str) -> Result<String, String> {
+    let mut padded = input.to_string();
+    // Add padding
+    while padded.len() % 4 != 0 {
+        padded.push('=');
+    }
+    // URL-safe to standard base64
+    let standard = padded.replace('-', "+").replace('_', "/");
+
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&standard)
+        .map_err(|e| e.to_string())?;
+
+    String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
 // ── MCP ──────────────────────────────────────────────────────────────────────
@@ -289,12 +401,18 @@ impl IProviderSessionSynchronizer for CodexSessionSynchronizer {
         let path = std::path::Path::new(&file_path);
         let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
 
-        crate::db::repos::sessions::SessionsRepo::upsert(
-            session_id,
-            "codex",
+        let project_path = crate::shared::utils::extract_project_path_from_session_file(
+            path,
             &std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("/"))
                 .to_string_lossy(),
+        )
+        .await;
+
+        crate::db::repos::sessions::SessionsRepo::upsert(
+            session_id,
+            "codex",
+            &project_path,
             None,
             Some(&file_path),
         );

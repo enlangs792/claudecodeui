@@ -6,6 +6,15 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 default-run = "cloudcli-server"
 
+[features]
+default = ["acp-bridge"]
+legacy-cli-agents = []
+acp-bridge = [
+    "dep:agent-client-protocol",
+    "dep:agent-client-protocol-tokio",
+    "dep:which",
+]
+
 [[bin]]
 name = "cloudcli-server"
 path = "src/main.rs"
@@ -13,6 +22,11 @@ path = "src/main.rs"
 [[bin]]
 name = "cloudcli"
 path = "src/cli/main.rs"
+
+[[bin]]
+name = "mock-acp-agent"
+path = "tests/fixtures/mock_acp_agent.rs"
+required-features = ["acp-bridge"]
 
 [dependencies]
 axum = { version = "0.8", features = ["ws", "multipart"] }
@@ -40,7 +54,14 @@ dirs = "6"
 anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
+agent-client-protocol = { version = "0.12", optional = true }
+agent-client-protocol-tokio = { version = "0.11", optional = true }
+dashmap = "6"
+which = { version = "7", optional = true }
+
+# Always available for session registry (lightweight)
 
 [dev-dependencies]
+agent-client-protocol = "0.12"
 tokio-test = "0.4"
 tempfile = "3"

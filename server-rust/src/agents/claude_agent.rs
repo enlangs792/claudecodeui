@@ -76,17 +76,26 @@ pub async fn spawn_claude(
         args.push(model.clone());
     }
 
-    // Permission mode
+    // Permission mode — default to bypass (matching TS behavior)
     if options.skip_permissions {
         args.push("-f".into());
     } else if let Some(ref mode) = options.permission_mode {
-        args.push("--permission-mode".into());
-        args.push(mode.clone());
+        if mode == "bypassPermissions" || mode == "default" {
+            // "default" in frontend maps to -f for CLI (no interactive approval in Rust)
+            args.push("-f".into());
+        } else {
+            args.push("--permission-mode".into());
+            args.push(mode.clone());
+        }
+    } else {
+        // No permission mode specified — default to skip for non-interactive mode
+        args.push("-f".into());
     }
 
-    // Streaming JSON output
+    // Streaming JSON output (requires --verbose in recent Claude Code versions)
     args.push("--output-format".into());
     args.push("stream-json".into());
+    args.push("--verbose".into());
 
     // Working directory
     let working_dir = options.cwd.unwrap_or_else(|| options.project_path.clone());
@@ -94,7 +103,7 @@ pub async fn spawn_claude(
     let mut child = Command::new("claude")
         .args(&args)
         .current_dir(&working_dir)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
